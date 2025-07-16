@@ -7,23 +7,26 @@ import win32ui	# NOTE: required, causes an error if not imported
 from ctypes import byref, create_string_buffer, c_int
 from win32api import GetSystemMetrics
 
-# Define DWM_THUMBNAIL_PROPERTIES structure
+# Define DWM_THUMBNAIL_PROPERTIES structure and constants
 class DWM_THUMBNAIL_PROPERTIES(ctypes.Structure):
 	_fields_ = [
 		("dwFlags", ctypes.c_uint),
-		("rcDestination", ctypes.c_long * 4), # RECT
-		("rcSource", ctypes.c_long * 4),      # RECT
+		("rcDestination", ctypes.c_long * 4),	# RECT
+		("rcSource", ctypes.c_long * 4),		# RECT
 		("opacity", ctypes.c_ubyte),
 		("fVisible", ctypes.c_bool),
 		("fSourceClientAreaOnly", ctypes.c_bool),
 	]
-
-# Define thumbnail flags
 DWM_TNP_RECTDESTINATION = 0x00000001
 DWM_TNP_RECTSOURCE = 0x00000002
 DWM_TNP_OPACITY = 0x00000004
 DWM_TNP_VISIBLE = 0x00000008
 DWM_TNP_SOURCECLIENTAREAONLY = 0x00000010
+
+# Window style modes
+WINDOW_MODE_NORMAL = 0		# Normal window with borders, not always on top
+WINDOW_MODE_TOPMOST = 1		# Normal window with borders, always on top
+WINDOW_MODE_MINIMAL = 2		# Borderless window, always on top
 
 g_user32 = ctypes.windll.user32			# user32 library handle
 g_dwmapi_lib = ctypes.windll.dwmapi		# dwmapi library handle
@@ -35,10 +38,12 @@ g_pip_hwnd = None # Global handle for the PiP window
 g_thumb_handle = None
 g_pip_padding = 10 # Define your desired padding for the thumbnail within the PiP window
 g_current_thumb_rect_in_pip = None # Store the current thumbnail rectangle in the PiP window
-g_initial_window_style = None # Store the initial style of the PiP window
-g_initial_window_ex_style = None # Store the initial extended style of the PiP window
+g_normal_window_style = win32con.WS_OVERLAPPEDWINDOW | win32con.WS_VISIBLE # Normal style for PiP window
+g_normal_window_ex_style = 0 # Normal extended style for PiP window (no special flags)
 g_minimal_window_style = win32con.WS_POPUP | win32con.WS_VISIBLE # Minimal style for PiP window
 g_minimal_window_ex_style = win32con.WS_EX_TOOLWINDOW | win32con.WS_EX_TOPMOST # Minimal extended style for PiP window
+g_topmost_window_ex_style = win32con.WS_EX_TOPMOST # Normal style but always on top
+g_current_window_mode = WINDOW_MODE_NORMAL # Current window mode
 
 SETTINGS_FILE = os.path.splitext(sys.argv[0])[0] + '.json'
 DEBUG_PY = 'debugpy' in sys.modules # or: any('debugpy' in m for m in sys.modules)
@@ -123,9 +128,9 @@ def save_window_placement(hwnd):
 	global saved_settings_data
 	# Save the current position of the PiP window to a JSON file
 	rect = win32gui.GetWindowRect(hwnd)
-	style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+	
 	settings = {"left": rect[0], "top": rect[1], "right": rect[2], "bottom": rect[3],
-			 "borderless": style != g_initial_window_style }
+			 "window_mode": g_current_window_mode }
 	if saved_settings_data != settings:
 		print(f"Saving window placement: {settings}")
 		with open(SETTINGS_FILE, "wt") as f:
@@ -143,9 +148,8 @@ def load_window_placement(settings_file=SETTINGS_FILE):
 		return None
 
 
-def create_pip_window(x, y, width, height, title="PiP View"):
-	"""Creates a simple, borderless, always-on-top window."""
-	global g_initial_window_style, g_initial_window_ex_style
+def create_pip_window(x, y, width, height, window_mode, title="PiP View"):
+	"""Creates a PiP window with the specified window mode."""
 
 	# Register window class
 	wc = win32gui.WNDCLASS()
@@ -160,11 +164,9 @@ def create_pip_window(x, y, width, height, title="PiP View"):
 		else:
 			raise
 
-	# Create the window
-	# style = win32con.WS_POPUP | win32con.WS_VISIBLE # Borderless popup
-	# ex_style = win32con.WS_EX_TOOLWINDOW | win32con.WS_EX_TOPMOST # No taskbar icon, always on top
-	style = win32con.WS_OVERLAPPEDWINDOW | win32con.WS_VISIBLE
-	ex_style = 0 # win32con.WS_EX_TOPMOST # No taskbar icon, always on top
+	# Get the correct style flags for the window mode
+	style, ex_style, _, mode_name = get_window_style_flags(window_mode)
+	print(f"Creating window with style: {mode_name}")
 
 	hwnd = win32gui.CreateWindowEx(
 		ex_style,
@@ -174,11 +176,6 @@ def create_pip_window(x, y, width, height, title="PiP View"):
 		x, y, width, height,
 		0, 0, win32api.GetModuleHandle(None), None
 	)
-
-	# Store the initial window style and extended style
-	g_initial_window_style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
-	g_initial_window_ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-	print(f"Initial window styles: {g_initial_window_style}, {g_initial_window_ex_style}")
 
 	return hwnd
 
@@ -363,7 +360,9 @@ class Timer(NamedTuple):
 MENU_ID_EXIT = 1001
 MENU_ID_ABOUT = 1002
 MENU_ID_APP_TO_FRONT = 1003
-MENU_ID_TOGGLE_WINDOW_STYLE = 1005
+MENU_ID_WINDOW_MODE_NORMAL = 1004
+MENU_ID_WINDOW_MODE_TOPMOST = 1005
+MENU_ID_WINDOW_MODE_MINIMAL = 1006
 
 TIMER_CHECK_SOURCE = Timer(id=2001, ms=200)  # Check source window every 200 ms
 TIMER_SAVE_WIN_POS = Timer(id=2002, ms=1000) # Save window position every second
@@ -376,7 +375,20 @@ def present_context_menu(hwnd, screen_x, screen_y):
 
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_APP_TO_FRONT, "Bring Source App to Front")
 	win32gui.AppendMenu(hmenu, win32con.MF_SEPARATOR, 0, "")
-	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_TOGGLE_WINDOW_STYLE, "Toggle Minimal Style")
+	
+	# Add window mode options with current selection checked
+	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_WINDOW_MODE_NORMAL, "Normal Window")
+	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_WINDOW_MODE_TOPMOST, "Always on Top")
+	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_WINDOW_MODE_MINIMAL, "Minimal (Borderless)")
+	
+	# Check the current window mode
+	if g_current_window_mode == WINDOW_MODE_NORMAL:
+		win32gui.CheckMenuItem(hmenu, MENU_ID_WINDOW_MODE_NORMAL, win32con.MF_CHECKED)
+	elif g_current_window_mode == WINDOW_MODE_TOPMOST:
+		win32gui.CheckMenuItem(hmenu, MENU_ID_WINDOW_MODE_TOPMOST, win32con.MF_CHECKED)
+	elif g_current_window_mode == WINDOW_MODE_MINIMAL:
+		win32gui.CheckMenuItem(hmenu, MENU_ID_WINDOW_MODE_MINIMAL, win32con.MF_CHECKED)
+	
 	win32gui.AppendMenu(hmenu, win32con.MF_SEPARATOR, 0, "")
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_ABOUT, "About...")
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_EXIT, "Exit PiP")
@@ -384,10 +396,6 @@ def present_context_menu(hwnd, screen_x, screen_y):
 	# Disable "Bring Source App to Front" if no source window is available
 	if g_source_hwnd is None:
 		win32gui.EnableMenuItem(hmenu, MENU_ID_APP_TO_FRONT, win32con.MF_GRAYED)
-	# Check the current state of the window style
-	current_style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
-	win32gui.CheckMenuItem(hmenu, MENU_ID_TOGGLE_WINDOW_STYLE,
-			win32con.MF_UNCHECKED if current_style == g_initial_window_style else win32con.MF_CHECKED)
 
 	# Display the context menu
 	result = win32gui.TrackPopupMenu(hmenu,
@@ -431,30 +439,39 @@ def handle_source_window_status(hwnd):
 	else:
 		print("Thumbnail successfully updated for the new source window.")
 
-def set_pip_window_style(borderless):
-	current_style = win32gui.GetWindowLong(g_pip_hwnd, win32con.GWL_STYLE)
-	current_borderless = not (current_style == g_initial_window_style)
-	if borderless is None:
-		# Toggle the borderless state
-		borderless = not current_borderless
-	elif borderless == current_borderless:
+def get_window_style_flags(window_mode):
+	"""Returns the style flags for a given window mode."""
+	if window_mode == WINDOW_MODE_MINIMAL:
+		# Minimal style (borderless, always on top)
+		return (g_minimal_window_style, g_minimal_window_ex_style, win32con.HWND_TOPMOST, "Minimal (Borderless, Always on Top)")
+	elif window_mode == WINDOW_MODE_TOPMOST:
+		# Normal style but always on top
+		return (g_normal_window_style, g_topmost_window_ex_style, win32con.HWND_TOPMOST, "Normal (Always on Top)")
+	else:  # WINDOW_MODE_NORMAL
+		# Normal style, not always on top
+		return (g_normal_window_style, g_normal_window_ex_style, win32con.HWND_NOTOPMOST, "Normal")
+
+def set_pip_window_style(window_mode):
+	global g_current_window_mode
+	
+	if window_mode is None:
+		# Cycle to the next mode
+		window_mode = (g_current_window_mode + 1) % 3
+	elif window_mode == g_current_window_mode:
 		# No change needed, return early
 		return
-	# Set the new window styles
+	
+	# Get the style flags for the new mode
+	target_style, target_ex_style, insert_after, mode_name = get_window_style_flags(window_mode)
 	window_uFlags = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED
-	if borderless:
-		# Add minimal style
-		target_style = g_minimal_window_style
-		target_ex_style = g_minimal_window_ex_style
-		insert_after = win32con.HWND_TOPMOST # Ensure it stays on top
-	else:
-		# Remove minimal style
-		target_style = g_initial_window_style
-		target_ex_style = g_initial_window_ex_style
-		insert_after = win32con.HWND_NOTOPMOST # Restore to normal
+	
+	print(f"Setting window style to: {mode_name}")
 	win32gui.SetWindowLong(g_pip_hwnd, win32con.GWL_STYLE, target_style)
 	win32gui.SetWindowLong(g_pip_hwnd, win32con.GWL_EXSTYLE, target_ex_style)
 	win32gui.SetWindowPos(g_pip_hwnd, insert_after, 0, 0, 0, 0, window_uFlags)
+	
+	# Update the global current window mode
+	g_current_window_mode = window_mode
 
 def split_lparam_pos(lparam):
 	"""Splits the lparam into x and y coordinates."""
@@ -473,25 +490,32 @@ def split_lparam_pos(lparam):
 
 def pip_window_proc(hwnd, msg, wparam, lparam):
 	"""Window procedure for the PiP window."""
-	global g_initial_window_style, g_initial_window_ex_style
 
 	if msg == win32con.WM_NCHITTEST:
 		# Handle non-client area hit testing
-
-		# Always allow dragging if the window is not active
-		if win32gui.GetActiveWindow() != hwnd:
-			# Return HTCAPTION to allow dragging the entire client area
+		
+		# First get the default hit test result to preserve normal window behaviour
+		default_result = win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+		
+		# If it's a border or corner for resizing, allow normal behavior
+		if default_result in (win32con.HTLEFT, win32con.HTRIGHT, win32con.HTTOP, win32con.HTBOTTOM,
+							  win32con.HTTOPLEFT, win32con.HTTOPRIGHT, win32con.HTBOTTOMLEFT, 
+							  win32con.HTBOTTOMRIGHT):
+			return default_result
+		
+		# For client area, check if we should customize behavior
+		if default_result == win32con.HTCLIENT:
+			screen_x, screen_y = win32gui.ScreenToClient(hwnd, split_lparam_pos(lparam))
+			
+			# If mouse is over the thumbnail area, pass through clicks
+			if check_within_pip_rect(screen_x, screen_y):
+				return win32con.HTCLIENT
+			
+			# If mouse is in the gap area around the thumbnail, enable dragging
 			return win32con.HTCAPTION
-
-		# Don't pass through hit testing unless the mouse is within the PiP rectangle
-		screen_x, screen_y = win32gui.ScreenToClient(hwnd, split_lparam_pos(lparam))
-		if not check_within_pip_rect(screen_x, screen_y):
-			# Return HTCAPTION to allow dragging the entire client area
-			return win32con.HTCAPTION
-
-		# Return HTCLIENT to pass through hit testing
-		return win32con.HTCLIENT
-		# NOTE: fallthrough does not work here
+		
+		# For all other areas (title bar, etc.), use default behavior
+		return default_result
 
 	elif msg == win32con.WM_SETCURSOR:
 		if win32api.LOWORD(lparam) == win32con.HTCLIENT:
@@ -520,10 +544,7 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 		# ps = win32gui.PAINTSTRUCT()
 		hdc, ps = win32gui.BeginPaint(hwnd) # Get DC for painting
 
-		# 1. Draw the background of the PiP window (if not entirely filled by thumbnail/box)
-		#    This is important to prevent "trails" or transparency issues
-		#    You can fill the entire client area or just the remaining areas
-		#    For simplicity, let's fill the entire background with a light gray
+		# 1. Draw the background of the PiP window
 		background_color = win32api.RGB(60, 60, 60) # Dark gray background
 		client_rect = win32gui.GetClientRect(hwnd)
 		fill_brush = win32gui.CreateSolidBrush(background_color) # Dark gray background
@@ -642,9 +663,17 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 			else:
 				win32gui.MessageBox(hwnd, "No source application found.", "Error", win32con.MB_OK | win32con.MB_ICONERROR)
 			return 0
-		elif cmd_id == MENU_ID_TOGGLE_WINDOW_STYLE:
-			# Toggle the minimal style of the PiP window
-			set_pip_window_style(None)
+		elif cmd_id == MENU_ID_WINDOW_MODE_NORMAL:
+			# Set window to normal mode
+			set_pip_window_style(WINDOW_MODE_NORMAL)
+			return 0
+		elif cmd_id == MENU_ID_WINDOW_MODE_TOPMOST:
+			# Set window to always on top mode
+			set_pip_window_style(WINDOW_MODE_TOPMOST)
+			return 0
+		elif cmd_id == MENU_ID_WINDOW_MODE_MINIMAL:
+			# Set window to minimal mode
+			set_pip_window_style(WINDOW_MODE_MINIMAL)
 			return 0
 		else:
 			print(f"Unhandled command ID: {cmd_id}")
@@ -664,15 +693,10 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 
 	return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
-""" TODO:
-Dragging: Handle WM_NCHITTEST to return HTCAPTION for the entire client area (or a specific part), or handle WM_LBUTTONDOWN to track mouse movements and use SetWindowPos to move the window.
-Resizing: Handle WM_NCHITTEST to return HTBOTTOMRIGHT, HTTOP, HTLEFT, etc., when the mouse is near the edges of your minimal window, or manually handle mouse events to resize.
-"""
-
-# --- Main Logic (Illustrative) ---
+# --- Main Logic ---
 
 def setup():
-	global g_target_app_match, g_source_hwnd, g_pip_hwnd, g_current_thumb_rect_in_pip
+	global g_target_app_match, g_source_hwnd, g_pip_hwnd, g_current_thumb_rect_in_pip, g_current_window_mode
 
 	# target_app_title = "Sky"
 	g_target_app_match = window_finder_by_regex(r'^Sky$', 'TgcMainWindow')
@@ -692,7 +716,7 @@ def setup():
 		pip_y = settings["top"]
 		pip_width = settings["right"] - settings["left"]
 		pip_height = settings["bottom"] - settings["top"]
-		borderless = settings.get("borderless", False)
+		window_mode = settings.get("window_mode", WINDOW_MODE_NORMAL)
 	else:
 		#- Default position if no saved settings
 		screen_width = GetSystemMetrics(win32con.SM_CXSCREEN)
@@ -702,20 +726,18 @@ def setup():
 		pip_height = 200
 		pip_x = screen_width - pip_width - 20 # 20px from right edge
 		pip_y = screen_height - pip_height - 20 # 20px from bottom edge
-		borderless = False
+		window_mode = WINDOW_MODE_NORMAL
+
+	# Set the initial window mode
+	g_current_window_mode = window_mode
 
 	print(f"Creating PiP window at {pip_x}x{pip_y}+{pip_width}x{pip_height}...")
-	g_pip_hwnd = create_pip_window(pip_x, pip_y, pip_width, pip_height)
+	g_pip_hwnd = create_pip_window(pip_x, pip_y, pip_width, pip_height, window_mode)
 	if not g_pip_hwnd:
 		print("Failed to create PiP window.")
 		exit(1)
 	else:
 		print(f"PiP window created with HWND: {g_pip_hwnd}")
-
-	if borderless:
-		# Set the PiP window to minimal style (borderless, always on top)
-		print("PiP window set to minimal style (borderless, always on top).")
-		set_pip_window_style(True)
 
 	# Get the client area dimensions of the destination (PiP) window
 	g_current_thumb_rect_in_pip = pip_rect = get_inner_client_rect(g_pip_hwnd)
@@ -741,7 +763,7 @@ def setup():
 def run():
 	try:
 		# This is the main message loop
-		result = win32gui.PumpMessages()
+		win32gui.PumpMessages()
 	except Exception as e:
 		print(f"Error in message loop: {e}")
 	finally:
