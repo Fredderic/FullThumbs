@@ -1,0 +1,1 @@
+"""FullThumbs package initialization."""
