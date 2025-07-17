@@ -26,6 +26,69 @@ and comprehensive command-line options.
 
 ## Installation
 
+### Option 1: Virtual Environment (Recommended)
+
+1. **Download the repository:**
+   ```bash
+   # Clone with git
+   git clone https://github.com/Fredderic/FullThumbs.git
+   cd FullThumbs
+   
+   # Or download ZIP from GitHub and extract
+   ```
+
+2. **Create and activate a virtual environment:**
+   
+   **On Windows (PowerShell):**
+   ```powershell
+   # Create virtual environment
+   python -m venv .venv
+   
+   # Activate virtual environment
+   .venv\Scripts\Activate.ps1
+   
+   # If execution policy prevents activation:
+   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+   .venv\Scripts\Activate.ps1
+   ```
+   
+   **On Windows (Command Prompt):**
+   ```cmd
+   # Create virtual environment
+   python -m venv .venv
+   
+   # Activate virtual environment
+   .venv\Scripts\activate.bat
+   ```
+   
+   **On Linux/macOS:**
+   ```bash
+   # Create virtual environment
+   python3 -m venv .venv
+   
+   # Activate virtual environment
+   source .venv/bin/activate
+   ```
+
+3. **Install required dependencies:**
+   ```bash
+   # With virtual environment activated
+   pip install -r requirements.txt
+   ```
+
+4. **Run the application:**
+   ```bash
+   # Virtual environment should still be activated
+   python full-thumbs.py
+   ```
+
+5. **Deactivate when done (optional):**
+   ```bash
+   deactivate
+   ```
+
+### Option 2: System-wide Installation
+
 1. **Download the repository:**
    ```bash
    # Clone with git
@@ -70,7 +133,9 @@ python full-thumbs.py run
 The application uses a subcommand structure:
 - **Main command**: Handles auto-update configuration and runs the application with update checking
 - **`run` subcommand**: Runs the application directly without the auto-update loop (primarily for internal use)
-  - `--update-interval SECONDS`: Sets auto-update check interval in seconds (0 to disable)
+  - `--update-interval MILLISECONDS`: Sets auto-update check interval in milliseconds (0 to disable)
+  - `--debug-simulate-update`: Debug mode flag to simulate finding updates
+  - **Exit codes**: The application uses exit code 2 to signal that updates were found and a restart is needed
 
 ## Auto-Update System
 
@@ -133,6 +198,44 @@ python full-thumbs.py --no-auto-update
 When `DEBUG_PY = True` in `src/constants.py`:
 - Auto-updates are disabled
 - Direct execution without auto-update loop
+
+### Automated Version Management
+
+For developers, the project includes automated version management scripts:
+
+**PowerShell (Windows - Recommended):**
+```powershell
+# Stage your changes
+git add .
+
+# Auto-increment patch version (v1.0.0 → v1.0.1)
+.\version-commit.ps1
+
+# Auto-increment minor version (v1.0.0 → v1.1.0)
+.\version-commit.ps1 -Type minor
+
+# Auto-increment major version (v1.0.0 → v2.0.0)
+.\version-commit.ps1 -Type major
+```
+
+**Bash (Cross-platform):**
+```bash
+# Stage your changes
+git add .
+
+# Auto-increment patch version and commit
+bash version-commit.sh
+```
+
+**What these scripts do:**
+- 🔍 Detect current version from Git tags
+- 📈 Auto-increment version (patch/minor/major)
+- 🧪 Run full test suite before committing
+- 📝 Create detailed commit message with file list
+- 🏷️ Create Git tag for the new version
+- 💡 Show next steps for pushing changes
+
+This eliminates the need to manually remember version tagging and ensures all commits are properly tested.
 
 ## Testing
 

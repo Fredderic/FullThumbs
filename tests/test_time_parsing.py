@@ -191,6 +191,24 @@ class TestTimeIntervalParsing(unittest.TestCase):
 		self.assertEqual(parse_time_interval("0s"), 0)
 		self.assertEqual(parse_time_interval("0"), 0)
 
+	def test_special_values(self):
+		"""Test parsing special values 'default' and 'minimum'."""
+		from src import constants
+		
+		# Test 'default' special value
+		self.assertEqual(parse_time_interval("default"), constants.DEFAULT_UPDATE_INTERVAL_MS)
+		self.assertEqual(parse_time_interval("Default"), constants.DEFAULT_UPDATE_INTERVAL_MS)
+		self.assertEqual(parse_time_interval("DEFAULT"), constants.DEFAULT_UPDATE_INTERVAL_MS)
+		
+		# Test 'minimum' special value
+		self.assertEqual(parse_time_interval("minimum"), constants.MIN_UPDATE_INTERVAL_MS)
+		self.assertEqual(parse_time_interval("Minimum"), constants.MIN_UPDATE_INTERVAL_MS)
+		self.assertEqual(parse_time_interval("MINIMUM"), constants.MIN_UPDATE_INTERVAL_MS)
+		
+		# Verify the constants have expected values
+		self.assertEqual(constants.DEFAULT_UPDATE_INTERVAL_MS, 14_400_000)  # 4 hours
+		self.assertEqual(constants.MIN_UPDATE_INTERVAL_MS, 60_000)  # 1 minute
+
 class TestAutoUpdateValidation(unittest.TestCase):
 	"""Test the validate_auto_update_interval function."""
 	

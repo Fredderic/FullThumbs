@@ -80,8 +80,8 @@ def check_for_git_updates():
 
 def get_default_window_area():
 	"""Get default window area for PiP."""
-	screen_width = GetSystemMetrics(win32con.SM_CXSCREEN)
-	screen_height = GetSystemMetrics(win32con.SM_CYSCREEN)
+	screen_width = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+	screen_height = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
 	print(f"Screen dimensions: {screen_width}x{screen_height}")
 	pip_width = 300
 	pip_height = 200
@@ -192,7 +192,14 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 			return 0 # indicate we handled the message
 		elif wparam == TIMER_UPDATE_CHECK.id:
 			# Check for git updates if enabled
-			check_for_git_updates()
+			from . import main
+			if getattr(main, 'g_debug_simulate_update', False):
+				# Debug mode: simulate finding updates
+				print("🐛 Debug: Simulating 'updates found' - requesting restart...")
+				main.g_exit_code = 2  # Signal update restart needed
+				win32gui.PostQuitMessage(2)
+			else:
+				check_for_git_updates()
 			return 0
 		# NOTE: do not call DefWindowProc for handled commands
 

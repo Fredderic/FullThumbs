@@ -113,7 +113,14 @@ class TestArgumentParsing(unittest.TestCase):
 		"""Test auto-update with default interval."""
 		with patch('sys.argv', ['full-thumbs.py', '--auto-update']):
 			args = full_thumbs.parse_arguments()
-			self.assertEqual(args.auto_update, '4h')
+			self.assertEqual(args.auto_update, 'default')
+	
+	def test_no_arguments_default_behavior(self):
+		"""Test default behavior when no auto-update arguments are specified."""
+		with patch('sys.argv', ['full-thumbs.py']):
+			args = full_thumbs.parse_arguments()
+			self.assertIsNone(args.auto_update)
+			self.assertFalse(args.no_auto_update)
 	
 	def test_auto_update_custom_interval(self):
 		"""Test auto-update with custom interval."""

@@ -19,3 +19,7 @@ WINDOW_MODE_MINIMAL_TEXT = "Minimal (Borderless)"	# "Minimal (Borderless, Always
 SETTINGS_FILE = os.path.splitext(sys.argv[0])[0] + '.json'
 DEBUG_PY = 'debugpy' in sys.modules # or: any('debugpy' in m for m in sys.modules)
 PIP_PADDING = 10
+
+# Auto-update settings
+MIN_UPDATE_INTERVAL_MS = 60_000					# 60 seconds minimum
+DEFAULT_UPDATE_INTERVAL_MS = 4 * 60 * 60_000	# 4 hours default

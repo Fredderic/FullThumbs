@@ -14,6 +14,7 @@ def parse_time_interval(time_str):
 	Parse time interval string into milliseconds.
 	
 	Supports:
+	- Special values: 'default', 'minimum'
 	- Single units: '4h', '30m', '2d', '3600s', '500ms'
 	- Multiple units: '2h15m', '1d2h30m', '1h30m45s500ms'
 	- Numbers without units default to hours: '4' -> 4 hours
@@ -23,6 +24,14 @@ def parse_time_interval(time_str):
 	"""
 	if not time_str:
 		return None
+	
+	# Handle special values
+	if time_str.lower() == 'default':
+		from src import constants
+		return constants.DEFAULT_UPDATE_INTERVAL_MS
+	elif time_str.lower() == 'minimum':
+		from src import constants
+		return constants.MIN_UPDATE_INTERVAL_MS
 	
 	time_str = time_str.lower()
 	
@@ -56,12 +65,7 @@ def parse_time_interval(time_str):
 	
 	# Check that the entire string was consumed by our matches
 	# Reconstruct what we matched and compare with original
-	matched_parts = []
-	for value, unit in matches:
-		matched_parts.append(f"{value}{unit}")
-	reconstructed = ''.join(matched_parts)
-	
-	if reconstructed != time_str:
+	if ''.join(f"{value}{unit}" for value, unit in matches) != time_str:
 		return None  # String contains invalid characters or formatting
 	
 	# Check for duplicate units
@@ -93,6 +97,101 @@ def parse_time_interval(time_str):
 	return total_ms
 
 
+def _get_time_interval_parts(milliseconds):
+	"""
+	Internal function to break down milliseconds into time unit parts.
+	
+	Returns a list of (count, unit_name) tuples.
+	Example: 3661000 -> [(1, 'h'), (1, 'm'), (1, 's')]
+	"""
+	if milliseconds == 0:
+		return []
+	
+	# Define units in descending order (largest first)
+	units = [
+		('d', 24 * 3600_000),  # days
+		('h', 3600_000),       # hours  
+		('m', 60_000),         # minutes
+		('s', 1000),           # seconds
+		('ms', 1)              # milliseconds
+	]
+	
+	parts = []
+	remaining = milliseconds
+	
+	for unit_name, unit_value in units:
+		if remaining >= unit_value:
+			count = remaining // unit_value
+			remaining = remaining % unit_value
+			parts.append((count, unit_name))
+	
+	return parts
+
+
+def format_time_interval(milliseconds):
+	"""
+	Convert milliseconds back to human-readable format.
+	
+	Examples:
+	- 3600000 -> "1h"
+	- 60000 -> "1m" 
+	- 14400000 -> "4h"
+	- 9000000 -> "2h30m"
+	- 90000 -> "1m30s"
+	
+	Returns the most compact representation using appropriate units.
+	"""
+	if milliseconds == 0:
+		return "0"
+	
+	parts = _get_time_interval_parts(milliseconds)
+	return ''.join(f"{count}{unit}" for count, unit in parts) if parts else "0ms"
+
+
+def format_time_interval_words(milliseconds):
+	"""
+	Convert milliseconds to human-readable format using whole words.
+	
+	If the interval consists of only one time unit, uses full words like
+	"30 minutes" or "10 seconds". For compound intervals, falls back to
+	the compact format like "2h30m".
+	
+	Examples:
+	- 3600000 -> "1 hour"
+	- 60000 -> "1 minute"
+	- 30000 -> "30 seconds"
+	- 9000000 -> "2h30m" (compound, falls back)
+	- 90000 -> "1m30s" (compound, falls back)
+	"""
+	if milliseconds == 0:
+		return "0"
+	
+	parts = _get_time_interval_parts(milliseconds)
+	
+	if not parts:
+		return "0 milliseconds"
+	
+	# If only one part, use whole words
+	if len(parts) == 1:
+		count, unit = parts[0]
+		
+		# Define singular and plural forms
+		unit_words = {
+			'ms': ('millisecond', 'milliseconds'),
+			's': ('second', 'seconds'),
+			'm': ('minute', 'minutes'),
+			'h': ('hour', 'hours'),
+			'd': ('day', 'days')
+		}
+		
+		singular, plural = unit_words[unit]
+		word = singular if count == 1 else plural
+		return f"{count} {word}"
+	
+	# Multiple parts - fall back to compact format
+	return format_time_interval(milliseconds)
+
+
 def validate_auto_update_interval(milliseconds):
 	"""
 	Validate that auto-update interval meets minimum requirements.
@@ -101,11 +200,10 @@ def validate_auto_update_interval(milliseconds):
 	if milliseconds is None:
 		return None
 	
-	# Convert to seconds for validation
-	seconds = milliseconds // 1000
+	from src import constants
 	
-	# Enforce minimum interval of 60 seconds (1 minute) for auto-updates
-	if seconds > 0 and seconds < 60:
+	# Enforce minimum interval for auto-updates
+	if milliseconds > 0 and milliseconds < constants.MIN_UPDATE_INTERVAL_MS:
 		return None
 	
 	return milliseconds

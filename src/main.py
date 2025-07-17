@@ -21,13 +21,15 @@ g_pip_hwnd = None # Global handle for the PiP window
 g_source_hwnd = None
 g_thumbnail = None
 g_update_interval = 0  # Auto-update check interval
+g_debug_simulate_update = False  # Debug flag to simulate update restart
 
 
-def setup(update_interval_ms=0):
+def setup(update_interval_ms=0, debug_simulate_update=False):
 	global g_target_app_match, g_source_hwnd, g_pip_hwnd, g_current_thumb_rect_in_pip
-	global g_current_window_mode, g_thumbnail, g_update_interval
+	global g_current_window_mode, g_thumbnail, g_update_interval, g_debug_simulate_update
 	
 	g_update_interval = update_interval_ms
+	g_debug_simulate_update = debug_simulate_update
 
 	# target_app_title = "Sky"
 	g_target_app_match = window_finder_by_regex(r'^Sky$', 'TgcMainWindow')
@@ -77,7 +79,7 @@ def setup(update_interval_ms=0):
 			exit(1)
 
 	print("DWM thumbnail successfully registered. The PiP window should now show the live view.")
-	print("Click the PiP window to bring the source app to front (this feature is conceptual and needs more event handling).")
+	print("Click the PiP window to bring the source app to front.")
 	print("Right-click to close the PiP window and clean up.")
 
 	# Set a timer to periodically check the source window
@@ -104,4 +106,3 @@ def run():
 			win32gui.DestroyWindow(g_pip_hwnd) # Clean up PiP window
 		print("Cleanup complete.")
 		return g_exit_code  # Return exit code instead of calling exit()
-
