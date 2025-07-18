@@ -151,6 +151,346 @@ def present_context_menu(hwnd, screen_x, screen_y):
 	win32gui.DestroyMenu(hmenu) # Clean up the menu after use
 	return True # Indicate the menu was presented
 
+def show_about_dialog(parent_hwnd, about_text):
+	"""Show an about dialog with selectable text and clickable GitHub link."""
+	import webbrowser
+	
+	# Dialog dimensions and control IDs
+	DLG_WIDTH = 400
+	MARGIN = 10
+	BUTTON_HEIGHT = 25
+	BUTTON_WIDTH = 75
+	LINK_HEIGHT = 20
+	TITLE_BAR_HEIGHT = 30  # Approximate space for title bar and frame
+	
+	EDIT_CONTROL_ID = 1001
+	OK_BUTTON_ID = 1002
+	COPY_BUTTON_ID = 1003
+	GITHUB_LINK_ID = 1004
+
+	def calculate_text_extents(texts):
+		# Get a device context to measure text
+		desktop_dc = win32gui.GetDC(0)
+		
+		# Create the font we'll use in the dialog
+		dialog_font = win32gui.GetStockObject(17)  # DEFAULT_GUI_FONT
+		old_font = None
+		if dialog_font:
+			old_font = win32gui.SelectObject(desktop_dc, dialog_font)
+		
+		extents = []
+
+		for text in texts:
+			# Actually measure the text using GetTextExtentPoint32 for each line
+			total_height = maximum_width = 0
+			for line in text.split('\n'):
+				text_size = win32gui.GetTextExtentPoint32(desktop_dc, line.strip() or ' ')
+				maximum_width = max(maximum_width, text_size[0])
+				total_height += text_size[1]
+			extents.append( (maximum_width, total_height) )
+		
+		# Clean up
+		if old_font:
+			win32gui.SelectObject(desktop_dc, old_font)
+		win32gui.ReleaseDC(0, desktop_dc)
+		
+		return extents
+	
+	# Calculate text extents for both about text and link text
+	link_text = "Visit GitHub Repository"
+	text_extents = calculate_text_extents([about_text, link_text])
+	about_text_width, about_text_height = text_extents[0]
+	link_text_width, link_text_height = text_extents[1]
+	
+	# Add padding for edit widget's border and internal padding
+	about_text_height += 10  # Add padding for readability and widget borders
+	
+	# Calculate minimum required dialog height
+	min_content_height = about_text_height + 4*MARGIN + BUTTON_HEIGHT + link_text_height
+	min_dialog_height = min_content_height + TITLE_BAR_HEIGHT + 10
+	
+	# Use calculated height, but ensure a reasonable minimum
+	DLG_HEIGHT = max(min_dialog_height, 200)  # At least 200px tall
+	
+	# Calculate dialog position (center on parent)
+	if parent_hwnd:
+		parent_rect = win32gui.GetWindowRect(parent_hwnd)
+		parent_center_x = (parent_rect[0] + parent_rect[2]) // 2
+		parent_center_y = (parent_rect[1] + parent_rect[3]) // 2
+		
+		# Find which monitor the parent window is on
+		monitor_info = win32api.MonitorFromWindow(parent_hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+		monitor_info_ex = win32api.GetMonitorInfo(monitor_info)
+		monitor_rect = monitor_info_ex['Monitor']  # (left, top, right, bottom)
+		
+		# Use the monitor bounds for clipping
+		monitor_left, monitor_top, monitor_right, monitor_bottom = monitor_rect
+	else:
+		# No parent window - use primary monitor center
+		parent_center_x = win32api.GetSystemMetrics(win32con.SM_CXSCREEN) // 2
+		parent_center_y = win32api.GetSystemMetrics(win32con.SM_CYSCREEN) // 2
+		
+		# Use primary monitor bounds
+		monitor_left = 0
+		monitor_top = 0
+		monitor_right = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+		monitor_bottom = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
+	
+	dialog_x = parent_center_x - DLG_WIDTH // 2
+	dialog_y = parent_center_y - DLG_HEIGHT // 2
+	
+	# Ensure dialog stays on the specific monitor
+	dialog_x = max(monitor_left, min(dialog_x, monitor_right - DLG_WIDTH))
+	dialog_y = max(monitor_top, min(dialog_y, monitor_bottom - DLG_HEIGHT))
+	
+	# Global variables for dialog controls
+	dialog_hwnd = None
+	edit_hwnd = None
+	link_hwnd = None
+	dialog_font = None
+	underlined_font = None
+	mouse_over_link = False
+	
+	def dialog_wnd_proc(hwnd, msg, wparam, lparam):
+		nonlocal dialog_hwnd, edit_hwnd, link_hwnd, dialog_font, underlined_font, mouse_over_link
+		
+		if msg == win32con.WM_CTLCOLORSTATIC:
+			# Color the GitHub link blue
+			if lparam == link_hwnd:
+				hdc = wparam
+				win32gui.SetTextColor(hdc, win32api.RGB(0, 0, 255))  # Blue text
+				win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
+				# Return the dialog background brush
+				return win32gui.GetSysColorBrush(win32con.COLOR_BTNFACE)
+				
+		elif msg == win32con.WM_SETCURSOR:
+			# Change cursor to hand when over the link and handle hover
+			cursor_pos = win32gui.GetCursorPos()
+			window_at_cursor = win32gui.WindowFromPoint(cursor_pos)
+			if window_at_cursor == link_hwnd:
+				win32gui.SetCursor(win32gui.LoadCursor(0, win32con.IDC_HAND))
+				# Mouse is over link - switch to underlined font if not already
+				if not mouse_over_link:
+					mouse_over_link = True
+					if underlined_font and link_hwnd:
+						win32gui.SendMessage(link_hwnd, win32con.WM_SETFONT, underlined_font, True)
+						win32gui.InvalidateRect(link_hwnd, None, True)
+						win32gui.UpdateWindow(link_hwnd)
+				return True
+			else:
+				# Mouse is not over link - switch back to normal font if needed
+				if mouse_over_link:
+					mouse_over_link = False
+					if dialog_font and link_hwnd:
+						win32gui.SendMessage(link_hwnd, win32con.WM_SETFONT, dialog_font, True)
+						win32gui.InvalidateRect(link_hwnd, None, True)
+						win32gui.UpdateWindow(link_hwnd)
+				
+		elif msg == win32con.WM_COMMAND:
+			cmd_id = win32api.LOWORD(wparam)
+			notify_code = win32api.HIWORD(wparam)
+			
+			if cmd_id == OK_BUTTON_ID and notify_code == win32con.BN_CLICKED:
+				win32gui.DestroyWindow(hwnd)
+				return 0
+			elif cmd_id == COPY_BUTTON_ID and notify_code == win32con.BN_CLICKED:
+				# Select all text and copy to clipboard
+				if edit_hwnd:
+					win32gui.SendMessage(edit_hwnd, win32con.EM_SETSEL, 0, -1)
+					win32gui.SendMessage(edit_hwnd, win32con.WM_COPY, 0, 0)
+				return 0
+			elif cmd_id == GITHUB_LINK_ID and notify_code == win32con.STN_CLICKED:
+				# Handle link click
+				try:
+					webbrowser.open("https://github.com/Fredderic/FullThumbs")
+				except:
+					pass  # Failed to open browser
+				return 0
+				
+		elif msg == win32con.WM_CLOSE:
+			win32gui.DestroyWindow(hwnd)
+			return 0
+		elif msg == win32con.WM_DESTROY:
+			# Clean up created font before destroying dialog
+			if underlined_font and underlined_font != dialog_font:
+				try:
+					win32gui.DeleteObject(underlined_font)
+				except:
+					pass
+			# Re-enable parent window
+			if parent_hwnd:
+				win32gui.EnableWindow(parent_hwnd, True)
+				win32gui.SetForegroundWindow(parent_hwnd)
+			return 0
+		
+		return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+	
+	# Register dialog window class
+	try:
+		wc = win32gui.WNDCLASS()
+		wc.lpfnWndProc = dialog_wnd_proc
+		wc.lpszClassName = "AboutDialogClass"
+		wc.hInstance = win32api.GetModuleHandle(None)
+		wc.hbrBackground = win32con.COLOR_BTNFACE + 1
+		wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
+		
+		try:
+			win32gui.RegisterClass(wc)
+		except win32gui.error as e:
+			if e.winerror != 1410:  # Class already exists
+				raise
+		
+		# Create the dialog window
+		dialog_hwnd = win32gui.CreateWindowEx(
+			win32con.WS_EX_DLGMODALFRAME | win32con.WS_EX_TOPMOST,
+			"AboutDialogClass",
+			"About FullThumbs",
+			win32con.WS_POPUP | win32con.WS_CAPTION | win32con.WS_SYSMENU | win32con.WS_VISIBLE,
+			dialog_x, dialog_y, DLG_WIDTH, DLG_HEIGHT,
+			parent_hwnd, 0, win32api.GetModuleHandle(None), None
+		)
+		
+		# Create edit control for text display (multiline, read-only, with scrollbar)
+		# Calculate client area dimensions (excluding title bar and frame)
+		client_width = DLG_WIDTH - 20  # Account for frame
+		client_height = DLG_HEIGHT - TITLE_BAR_HEIGHT - 10  # Account for title bar and frame
+		edit_height = client_height - 4*MARGIN - BUTTON_HEIGHT - link_text_height  # Use measured link height
+		
+		edit_hwnd = win32gui.CreateWindow(
+			"EDIT",
+			about_text,
+			win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.ES_MULTILINE | 
+			win32con.ES_READONLY | win32con.WS_VSCROLL | win32con.ES_AUTOVSCROLL |
+			win32con.WS_BORDER,
+			MARGIN, MARGIN, 
+			client_width - 2*MARGIN, edit_height,
+			dialog_hwnd, EDIT_CONTROL_ID, win32api.GetModuleHandle(None), None
+		)
+		
+		# Set a better font for the edit control (standard Windows dialog font)
+		dialog_font = None
+		underlined_font = None
+		try:
+			# Get the default GUI font (standard Windows dialog font)
+			dialog_font = win32gui.GetStockObject(17)  # DEFAULT_GUI_FONT constant value
+			if dialog_font:
+				win32gui.SendMessage(edit_hwnd, win32con.WM_SETFONT, dialog_font, True)
+			
+			# Create an underlined version of the font for hover effect
+			try:
+				import ctypes
+				from ctypes import wintypes
+				
+				# Create underlined font using CreateFontW
+				underlined_font = ctypes.windll.gdi32.CreateFontW(
+					-11,           # Height (negative for character height)
+					0,             # Width (0 = default)
+					0,             # Escapement
+					0,             # Orientation
+					400,           # Weight (400 = normal)
+					0,             # Italic (0 = not italic)
+					1,             # Underline (1 = underlined)
+					0,             # StrikeOut (0 = not struck out)
+					1,             # CharSet (1 = DEFAULT_CHARSET)
+					0,             # OutPrecision
+					0,             # ClipPrecision
+					0,             # Quality
+					0,             # PitchAndFamily
+					"MS Shell Dlg" # FaceName
+				)
+			except:
+				# If creating underlined font fails, fall back to dialog font
+				underlined_font = dialog_font
+		except:
+			pass  # If font creation fails, use default
+		
+		# Create GitHub link as a static control
+		link_y = MARGIN + edit_height + MARGIN
+		link_hwnd = win32gui.CreateWindow(
+			"STATIC", 
+			link_text,
+			win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.SS_LEFT | win32con.SS_NOTIFY,
+			MARGIN, link_y, link_text_width + 5, link_text_height,  # Use measured dimensions
+			dialog_hwnd, GITHUB_LINK_ID, win32api.GetModuleHandle(None), None
+		)
+		
+		# Set the same font for the link
+		try:
+			win32gui.SendMessage(link_hwnd, win32con.WM_SETFONT, dialog_font, True)
+		except:
+			pass
+		
+		# Create Copy button - moved up by about 1/3 of button height
+		button_y = link_y + link_text_height + MARGIN//2  # Use measured link height
+		copy_button = win32gui.CreateWindow(
+			"BUTTON",
+			"Copy",
+			win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
+			client_width - 2*MARGIN - 2*BUTTON_WIDTH - 5, button_y,
+			BUTTON_WIDTH, BUTTON_HEIGHT,
+			dialog_hwnd, COPY_BUTTON_ID, win32api.GetModuleHandle(None), None
+		)
+		
+		# Set font for copy button
+		try:
+			win32gui.SendMessage(copy_button, win32con.WM_SETFONT, dialog_font, True)
+		except:
+			pass
+		
+		# Create OK button
+		ok_button = win32gui.CreateWindow(
+			"BUTTON",
+			"OK",
+			win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_DEFPUSHBUTTON,
+			client_width - MARGIN - BUTTON_WIDTH, button_y,
+			BUTTON_WIDTH, BUTTON_HEIGHT,
+			dialog_hwnd, OK_BUTTON_ID, win32api.GetModuleHandle(None), None
+		)
+		
+		# Set font for OK button
+		try:
+			win32gui.SendMessage(ok_button, win32con.WM_SETFONT, dialog_font, True)
+		except:
+			pass
+		
+		# # TEMPORARY TEST: Create two test labels to verify fonts work
+		# test_normal = win32gui.CreateWindow(
+		# 	"STATIC", 
+		# 	"Normal Font Test",
+		# 	win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.SS_LEFT,
+		# 	50, link_y+20, 120, 20,
+		# 	dialog_hwnd, 9999, win32api.GetModuleHandle(None), None
+		# )
+		# test_underlined = win32gui.CreateWindow(
+		# 	"STATIC", 
+		# 	"Underlined Font Test",
+		# 	win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.SS_LEFT,
+		# 	50, link_y+40, 120, 20,
+		# 	dialog_hwnd, 9998, win32api.GetModuleHandle(None), None
+		# )
+		# try:
+		# 	win32gui.SendMessage(test_normal, win32con.WM_SETFONT, dialog_font, True)
+		# 	win32gui.SendMessage(test_underlined, win32con.WM_SETFONT, underlined_font, True)
+		# except:
+		# 	pass
+		
+		# Select all text in the edit control and set focus
+		# win32gui.SendMessage(edit_hwnd, win32con.EM_SETSEL, 0, -1)  # Removed pre-selection
+		win32gui.SetFocus(edit_hwnd)
+		
+		# Disable parent window to make this modal
+		if parent_hwnd:
+			win32gui.EnableWindow(parent_hwnd, False)
+		
+		# Bring dialog to front
+		# win32gui.SetForegroundWindow(dialog_hwnd)
+		win32gui.SetActiveWindow(dialog_hwnd)
+		
+	except Exception as e:
+		print(f"Error creating about dialog: {e}")
+		# Fallback to simple message box
+		win32gui.MessageBox(parent_hwnd, about_text.replace('\r\n', '\n'), "About FullThumbs", win32con.MB_OK)
+
 def pip_window_proc(hwnd, msg, wparam, lparam):
 	"""Window procedure for the PiP window."""
 
@@ -331,20 +671,23 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 				win32gui.SendMessage(hwnd, win32con.WM_CLOSE, 0, 0)
 				return 0
 			elif cmd_id == MENU_ID_ABOUT:
-				# Show an about dialog or message box
+				# Show an about dialog with selectable text
 				from .version import get_version_info
 				from .constants import DEBUG_PY
 				info = get_version_info()
 				about_text = (
-					f"FullThumbs PiP Viewer\n"
-					f"Version: {info['version']}\n"
-					f"Commit: {info['commit_hash_short']}\n"
-					f"Branch: {info['branch']}\n"
+					f"FullThumbs PiP Viewer\r\n"
+					f"Version: {info['version']}\r\n"
+					f"Commit: {info['commit_hash_short']}\r\n"
+					f"Branch: {info['branch']}\r\n"
 					f"Built: {info['commit_date'][:10]}"  # Just the date part
 				)
 				if DEBUG_PY:
-					about_text += "\n\n🐛 Debug Mode Active"
-				win32gui.MessageBox(hwnd, about_text, "About FullThumbs", win32con.MB_OK)
+					about_text += "\r\n\r\n🐛 Debug Mode Active"
+				show_about_dialog(hwnd, about_text)
+				
+				# Old simple message box implementation (retained for comparison):
+				# win32gui.MessageBox(hwnd, about_text, "About FullThumbs", win32con.MB_OK)
 				return 0
 			elif cmd_id == MENU_ID_CHECK_UPDATES:
 				# Check for updates immediately
@@ -400,6 +743,11 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 
 def create_pip_window(x, y, width, height, window_mode, title="PiP View"):
 	"""Creates a PiP window with the specified window mode."""
+	
+	# Add debug indicator to title when running under debugger
+	from .constants import DEBUG_PY
+	if DEBUG_PY:
+		title += " (Debug)"
 
 	# Register window class
 	wc = win32gui.WNDCLASS()
