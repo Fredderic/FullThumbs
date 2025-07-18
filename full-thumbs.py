@@ -80,6 +80,10 @@ Note: Auto-update intervals must be at least {minimum_interval}.
 	parser.add_argument('--debug-loop', action='store_true',
 						help='Debug the production restart loop with git updates disabled')
 	
+	# Recovery option
+	parser.add_argument('--force-reinstall', action='store_true',
+						help='Force re-install from git repository (resets source files, preserves settings and venv)')
+	
 	return parser.parse_args()
 
 # --- Main Logic ---
@@ -132,6 +136,60 @@ def check_for_updates():
 		return False
 	except Exception as e:
 		print(f"Error checking for updates: {e}")
+		return False
+
+def reinstall_from_git():
+	"""Re-install from git repository, resetting source files while preserving settings and venv."""
+	try:
+		repo_dir = os.path.dirname(os.path.abspath(__file__))
+		
+		print("Re-installing from git repository...")
+		print("This will reset all source files to the repository state.")
+		print("Settings files and virtual environment will be preserved.")
+		
+		# Fetch latest changes from remote
+		print("\n1. Fetching latest changes...")
+		subprocess.run(['git', 'fetch'], cwd=repo_dir, check=True, capture_output=True)
+		
+		# Show current status
+		print("\n2. Checking current repository status...")
+		status_result = subprocess.run(
+			['git', 'status', '--porcelain'],
+			cwd=repo_dir,
+			capture_output=True,
+			text=True,
+			check=True
+		)
+		
+		if status_result.stdout.strip():
+			print("Modified files will be reset:")
+			for line in status_result.stdout.strip().split('\n'):
+				print(f"  {line}")
+		
+		# Reset all tracked files to HEAD
+		print("\n3. Resetting source files to repository state...")
+		subprocess.run(['git', 'reset', '--hard', 'HEAD'], cwd=repo_dir, check=True)
+		
+		# Clean untracked files (but preserve important ones)
+		print("\n4. Cleaning untracked files (preserving settings and venv)...")
+		# Remove untracked files except for settings and venv
+		subprocess.run(['git', 'clean', '-fd', '--exclude=*.json', '--exclude=.venv/', '--exclude=venv/'], 
+					  cwd=repo_dir, check=True)
+		
+		# Pull latest changes
+		print("\n5. Pulling latest changes...")
+		subprocess.run(['git', 'pull'], cwd=repo_dir, check=True)
+		
+		print("\n✅ Re-installation complete!")
+		print("Source files have been reset to the repository state.")
+		print("Settings files and virtual environment have been preserved.")
+		return True
+		
+	except subprocess.CalledProcessError as e:
+		print(f"❌ Git operation failed: {e}")
+		return False
+	except Exception as e:
+		print(f"❌ Error during re-installation: {e}")
 		return False
 
 def run_loop(args):
@@ -247,6 +305,21 @@ def run_loop(args):
 
 if __name__ == "__main__":
 	args = parse_arguments()
+	
+	# Handle force reinstall command
+	if args.force_reinstall:
+		# Prevent reinstall in debug mode to protect development environment
+		if constants.DEBUG_PY:
+			print("❌ Force reinstall is disabled in debug mode to protect the development environment.")
+			print("To reinstall, run the application outside of the debugger.")
+			sys.exit(1)
+		
+		if reinstall_from_git():
+			print("\nApplication has been re-installed successfully.")
+			print("You can now run the application normally.")
+		else:
+			print("\nRe-installation failed. Please check the error messages above.")
+		sys.exit(0)
 	
 	# Check if we should enable debug loop mode
 	debug_loop = getattr(args, 'debug_loop', False)

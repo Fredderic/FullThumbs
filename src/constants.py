@@ -2,7 +2,6 @@
 Constants and configuration values for FullThumbs application.
 """
 
-import win32con
 import sys
 import os
 

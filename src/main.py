@@ -92,10 +92,17 @@ def setup(update_interval_ms=0, debug_simulate_update=False):
 
 def run():
 	try:
-		# This is the main message loop
+		# Use the standard Windows message pump
+		# KeyboardInterrupt will be handled in the window procedure
 		win32gui.PumpMessages()
+	except KeyboardInterrupt:
+		# This may not be reached due to PumpMessages blocking,
+		# but the window procedure should handle Ctrl+C
+		print("KeyboardInterrupt received in main thread. Exiting cleanly...")
+		return 0  # Exit normally when Ctrl+C is pressed
 	except Exception as e:
 		print(f"Error in message loop: {e}")
+		return 1  # Exit with error code for unexpected exceptions
 	finally:
 		print("Cleaning up...")
 		if g_thumbnail:
@@ -105,4 +112,5 @@ def run():
 			save_window_placement(g_pip_hwnd) # Save the current position
 			win32gui.DestroyWindow(g_pip_hwnd) # Clean up PiP window
 		print("Cleanup complete.")
-		return g_exit_code  # Return exit code instead of calling exit()
+	
+	return g_exit_code  # Return exit code instead of calling exit()

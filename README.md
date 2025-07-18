@@ -160,6 +160,23 @@ python full-thumbs.py --auto-update=1d    # Daily
 python full-thumbs.py --no-auto-update
 ```
 
+### Recovery Options
+
+If your installation becomes corrupted or you need to reset to a clean state:
+
+```bash
+# Force reinstall from git repository (DESTRUCTIVE)
+python full-thumbs.py --force-reinstall
+```
+
+**⚠️ Warning**: The `--force-reinstall` option is destructive and will:
+- Reset all source files to the git repository state
+- Remove any local modifications to code files
+- Preserve settings files (JSON) and virtual environment
+- Disabled in debug mode to protect development environments
+
+Use this option only when you need to recover from a corrupted installation.
+
 ## Configuration
 
 - Window position and mode are automatically saved to `full-thumbs.json`
@@ -225,6 +242,19 @@ git add .
 
 # Auto-increment patch version and commit
 bash version-commit.sh
+```
+
+**Automatic Version Bumping:**
+The pre-commit hook now automatically bumps the patch version after tests pass, unless:
+- The commit message indicates a manual version bump
+- The current commit already has a version tag
+- Tests fail
+
+This means you can simply:
+```bash
+git add .
+git commit -m "Your commit message"
+# Version automatically bumped to v1.0.X after tests pass!
 ```
 
 **What these scripts do:**

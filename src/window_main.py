@@ -85,8 +85,8 @@ def get_default_window_area():
 	print(f"Screen dimensions: {screen_width}x{screen_height}")
 	pip_width = 300
 	pip_height = 200
-	pip_x = screen_width - pip_width - 20 # 20px from right edge
-	pip_y = screen_height - pip_height - 20 # 20px from bottom edge
+	pip_x = screen_width - pip_width - 2*PIP_PADDING
+	pip_y = screen_height - pip_height - 2*PIP_PADDING
 	return pip_x, pip_y, pip_width, pip_height
 
 # -------
@@ -98,6 +98,7 @@ MENU_ID_APP_TO_FRONT = 1003
 MENU_ID_WINDOW_MODE_NORMAL = 1004
 MENU_ID_WINDOW_MODE_TOPMOST = 1005
 MENU_ID_WINDOW_MODE_MINIMAL = 1006
+MENU_ID_CHECK_UPDATES = 1007
 
 TIMER_CHECK_SOURCE = Timer(id=2001, ms=200)  # Check source window every 200 ms
 TIMER_SAVE_WIN_POS = Timer(id=2002, ms=1000) # Save window position every second
@@ -106,7 +107,8 @@ TIMER_UPDATE_CHECK = Timer(id=2003, ms=None) # Update check timer with configura
 def present_context_menu(hwnd, screen_x, screen_y):
 	"""Present context menu at specified screen coordinates."""
 
-	from src.main import g_current_window_mode, g_source_hwnd
+	from src.main import g_current_window_mode, g_source_hwnd, g_update_interval
+	from src.constants import DEBUG_PY
 
 	hmenu = win32gui.CreatePopupMenu()
 
@@ -127,6 +129,12 @@ def present_context_menu(hwnd, screen_x, screen_y):
 		win32gui.CheckMenuItem(hmenu, MENU_ID_WINDOW_MODE_MINIMAL, win32con.MF_CHECKED)
 	
 	win32gui.AppendMenu(hmenu, win32con.MF_SEPARATOR, 0, "")
+	
+	# Show "Check for Updates" when NOT in debug mode (production or run_loop contexts)
+	# Hide it only in debug mode where git operations don't make sense
+	if not DEBUG_PY:
+		win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_CHECK_UPDATES, "Check for Updates")
+	
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_ABOUT, "About...")
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_EXIT, "Exit PiP")
 
@@ -146,229 +154,244 @@ def present_context_menu(hwnd, screen_x, screen_y):
 def pip_window_proc(hwnd, msg, wparam, lparam):
 	"""Window procedure for the PiP window."""
 
-	from src import main
+	try:
+		from src import main
 
-	if msg == win32con.WM_NCHITTEST:
-		# Handle non-client area hit testing
-		
-		# First get the default hit test result to preserve normal window behaviour
-		default_result = win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
-		
-		# If it's a border or corner for resizing, allow normal behavior
-		if default_result in (win32con.HTLEFT, win32con.HTRIGHT, win32con.HTTOP, win32con.HTBOTTOM,
-							  win32con.HTTOPLEFT, win32con.HTTOPRIGHT, win32con.HTBOTTOMLEFT, 
-							  win32con.HTBOTTOMRIGHT):
+		if msg == win32con.WM_NCHITTEST:
+			# Handle non-client area hit testing
+			
+			# First get the default hit test result to preserve normal window behaviour
+			default_result = win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+			
+			# If it's a border or corner for resizing, allow normal behavior
+			if default_result in (win32con.HTLEFT, win32con.HTRIGHT, win32con.HTTOP, win32con.HTBOTTOM,
+								  win32con.HTTOPLEFT, win32con.HTTOPRIGHT, win32con.HTBOTTOMLEFT, 
+								  win32con.HTBOTTOMRIGHT):
+				return default_result
+			
+			# For client area, check if we should customize behavior
+			if main.g_thumbnail and default_result == win32con.HTCLIENT:
+				screen_x, screen_y = win32gui.ScreenToClient(hwnd, split_lparam_pos(lparam))
+				
+				# If mouse is over the thumbnail area, pass through clicks
+				if main.g_thumbnail.check_within_thumbnail_rect(screen_x, screen_y):
+					return win32con.HTCLIENT
+				
+				# If mouse is in the gap area around the thumbnail, enable dragging
+				return win32con.HTCAPTION
+			
+			# For all other areas (title bar, etc.), use default behavior
 			return default_result
-		
-		# For client area, check if we should customize behavior
-		if main.g_thumbnail and default_result == win32con.HTCLIENT:
-			screen_x, screen_y = win32gui.ScreenToClient(hwnd, split_lparam_pos(lparam))
-			
-			# If mouse is over the thumbnail area, pass through clicks
-			if main.g_thumbnail.check_within_thumbnail_rect(screen_x, screen_y):
-				return win32con.HTCLIENT
-			
-			# If mouse is in the gap area around the thumbnail, enable dragging
-			return win32con.HTCAPTION
-		
-		# For all other areas (title bar, etc.), use default behavior
-		return default_result
 
-	elif msg == win32con.WM_SETCURSOR:
-		if win32api.LOWORD(lparam) == win32con.HTCLIENT:
-			# Set the cursor to a hand icon when hovering over the PiP window
-			win32gui.SetCursor(win32gui.LoadCursor(0, win32con.IDC_HAND))
-			return 0	# indicate we handled the message
-			# NOTE: fallthrough would set default cursor
+		elif msg == win32con.WM_SETCURSOR:
+			if win32api.LOWORD(lparam) == win32con.HTCLIENT:
+				# Set the cursor to a hand icon when hovering over the PiP window
+				win32gui.SetCursor(win32gui.LoadCursor(0, win32con.IDC_HAND))
+				return 0	# indicate we handled the message
+				# NOTE: fallthrough would set default cursor
 
-	elif msg == win32con.WM_TIMER:
-		# Handle periodic checks for the source window
-		if wparam == TIMER_CHECK_SOURCE.id:
-			handle_source_window_status(hwnd)
-			return 0 # indicate we handled the message
-		elif wparam == TIMER_SAVE_WIN_POS.id:
-			# Save the current position of the PiP window
-			save_window_placement(hwnd)
-			return 0 # indicate we handled the message
-		elif wparam == TIMER_UPDATE_CHECK.id:
-			# Check for git updates if enabled
-			from . import main
-			if getattr(main, 'g_debug_simulate_update', False):
-				# Debug mode: simulate finding updates
-				print("🐛 Debug: Simulating 'updates found' - requesting restart...")
-				main.g_exit_code = 2  # Signal update restart needed
-				win32gui.PostQuitMessage(2)
+		elif msg == win32con.WM_TIMER:
+			# Handle periodic checks for the source window
+			if wparam == TIMER_CHECK_SOURCE.id:
+				handle_source_window_status(hwnd)
+				return 0 # indicate we handled the message
+			elif wparam == TIMER_SAVE_WIN_POS.id:
+				# Save the current position of the PiP window
+				save_window_placement(hwnd)
+				return 0 # indicate we handled the message
+			elif wparam == TIMER_UPDATE_CHECK.id:
+				# Check for git updates if enabled
+				from . import main
+				if getattr(main, 'g_debug_simulate_update', False):
+					# Debug mode: simulate finding updates
+					print("🐛 Debug: Simulating 'updates found' - requesting restart...")
+					main.g_exit_code = 2  # Signal update restart needed
+					win32gui.PostQuitMessage(2)
+				else:
+					check_for_git_updates()
+				return 0
+			# NOTE: do not call DefWindowProc for handled commands
+
+		elif msg == win32con.WM_PAINT:
+			# Handle paint messages if needed (e.g., custom drawing)
+			# ps = win32gui.PAINTSTRUCT()
+			hdc, ps = win32gui.BeginPaint(hwnd) # Get DC for painting
+
+			# 1. Draw the background of the PiP window
+			background_color = win32api.RGB(60, 60, 60) # Dark gray background
+			client_rect = win32gui.GetClientRect(hwnd)
+			fill_brush = win32gui.CreateSolidBrush(background_color) # Dark gray background
+			win32gui.FillRect(hdc, client_rect, fill_brush)
+			win32gui.DeleteObject(fill_brush)
+
+			if main.g_thumbnail:
+				# 2. Draw the red box around the thumbnail area
+				# Create a red pen (for outline)
+				red_pen = win32gui.CreatePen(win32con.PS_SOLID, 2, win32api.RGB(255, 0, 0)) # 2 pixels thick
+				old_pen = win32gui.SelectObject(hdc, red_pen) # Select it into the DC
+				# Create a null brush (for no fill)
+				null_brush = win32gui.GetStockObject(win32con.NULL_BRUSH)
+				old_brush = win32gui.SelectObject(hdc, null_brush) # Select it into the DC
+				# Draw the rectangle
+				box_left, box_top, box_right, box_bottom = main.g_thumbnail.current_thumb_rect
+				win32gui.Rectangle(hdc, box_left-1, box_top-1, box_right+2, box_bottom+2)
+
 			else:
-				check_for_git_updates()
-			return 0
-		# NOTE: do not call DefWindowProc for handled commands
+				box_left, box_top, width, height = get_default_window_area()
+				box_right = box_left + width
+				box_bottom = box_top + height
+				# If no source window is available, draw missing application indicator
+				win32gui.Rectangle(hdc, box_left-1, box_top-1, box_right+2, box_bottom+2)
+				win32gui.MoveToEx(hdc, box_left, box_top)
+				win32gui.LineTo(hdc, box_right, box_bottom)
+				win32gui.MoveToEx(hdc, box_left, box_bottom)
+				win32gui.LineTo(hdc, box_right, box_top)
 
-	elif msg == win32con.WM_PAINT:
-		# Handle paint messages if needed (e.g., custom drawing)
-		# ps = win32gui.PAINTSTRUCT()
-		hdc, ps = win32gui.BeginPaint(hwnd) # Get DC for painting
+			# 	message = "Not Found"		-- TODO
+			# 	text_color = win32api.RGB(255, 255, 255)
+			# 	win32gui.SetTextColor(hdc, text_color)
+			# 	win32gui.SetBkMode(hdc, win32con.TRANSPARENT) # Transparent background
+			# 	# Draw the text in the center of the PiP window
+			# 	client_width = client_rect[2] - client_rect[0]
+			# 	client_height = client_rect[3] - client_rect[1]
+			# 	text_extent = win32gui.GetTextExtent(hdc, message)
+			# 	text_x = (client_width - text_extent[0]) // 2
+			# 	text_y = (client_height - text_extent[1]) // 2
+			# 	win32gui.TextOut(hdc, text_x, text_y, message)
 
-		# 1. Draw the background of the PiP window
-		background_color = win32api.RGB(60, 60, 60) # Dark gray background
-		client_rect = win32gui.GetClientRect(hwnd)
-		fill_brush = win32gui.CreateSolidBrush(background_color) # Dark gray background
-		win32gui.FillRect(hdc, client_rect, fill_brush)
-		win32gui.DeleteObject(fill_brush)
+			# Restore original GDI objects
+			win32gui.SelectObject(hdc, old_pen)
+			win32gui.DeleteObject(red_pen)
+			win32gui.SelectObject(hdc, old_brush) # NULL_BRUSH doesn't need deleting
 
-		if main.g_thumbnail:
-			# 2. Draw the red box around the thumbnail area
-			# Create a red pen (for outline)
-			red_pen = win32gui.CreatePen(win32con.PS_SOLID, 2, win32api.RGB(255, 0, 0)) # 2 pixels thick
-			old_pen = win32gui.SelectObject(hdc, red_pen) # Select it into the DC
-			# Create a null brush (for no fill)
-			null_brush = win32gui.GetStockObject(win32con.NULL_BRUSH)
-			old_brush = win32gui.SelectObject(hdc, null_brush) # Select it into the DC
-			# Draw the rectangle
-			box_left, box_top, box_right, box_bottom = main.g_thumbnail.current_thumb_rect
-			win32gui.Rectangle(hdc, box_left-1, box_top-1, box_right+2, box_bottom+2)
+			print(f"Drawing thumbnail box at: {box_left}, {box_top}, {box_right}, {box_bottom}")
 
-		else:
-			box_left, box_top, width, height = get_default_window_area()
-			box_right = box_left + width
-			box_bottom = box_top + height
-			# If no source window is available, draw missing application indicator
-			win32gui.Rectangle(hdc, box_left-1, box_top-1, box_right+2, box_bottom+2)
-			win32gui.MoveToEx(hdc, box_left, box_top)
-			win32gui.LineTo(hdc, box_right, box_bottom)
-			win32gui.MoveToEx(hdc, box_left, box_bottom)
-			win32gui.LineTo(hdc, box_right, box_top)
+			# NOTE: DWM thumbnails are rendered *on top* of anything you draw.
+			# So, drawing a background or border *first* is correct.
 
-		# 	message = "Not Found"		-- TODO
-		# 	text_color = win32api.RGB(255, 255, 255)
-		# 	win32gui.SetTextColor(hdc, text_color)
-		# 	win32gui.SetBkMode(hdc, win32con.TRANSPARENT) # Transparent background
-		# 	# Draw the text in the center of the PiP window
-		# 	client_width = client_rect[2] - client_rect[0]
-		# 	client_height = client_rect[3] - client_rect[1]
-		# 	text_extent = win32gui.GetTextExtent(hdc, message)
-		# 	text_x = (client_width - text_extent[0]) // 2
-		# 	text_y = (client_height - text_extent[1]) // 2
-		# 	win32gui.TextOut(hdc, text_x, text_y, message)
+			win32gui.EndPaint(hwnd, ps) # Release DC
+			return 0 # calling DefWindowProc is not necessary
 
-		# Restore original GDI objects
-		win32gui.SelectObject(hdc, old_pen)
-		win32gui.DeleteObject(red_pen)
-		win32gui.SelectObject(hdc, old_brush) # NULL_BRUSH doesn't need deleting
+		elif msg == win32con.WM_SIZE:
+			# Window has been resized.
+			# wparam: Type of resizing (SIZE_MAXIMIZED, SIZE_MINIMIZED, SIZE_RESTORED, etc.)
+			# lparam: LOWORD is new client width, HIWORD is new client height
+			new_client_width, new_client_height = split_lparam_pos(lparam)
+			print(f"PiP window resized to client dimensions: {new_client_width}x{new_client_height}")
 
-		print(f"Drawing thumbnail box at: {box_left}, {box_top}, {box_right}, {box_bottom}")
+			if main.g_thumbnail:
+				# Recalculate thumbnail's destination rectangle based on new client size
+				thumb_draw_top = PIP_PADDING
+				thumb_draw_left = PIP_PADDING
+				thumb_draw_right = max(PIP_PADDING, new_client_width - PIP_PADDING)
+				thumb_draw_bottom = max(PIP_PADDING, new_client_height - PIP_PADDING)
+				thumb_draw_rect = (thumb_draw_left, thumb_draw_top, thumb_draw_right, thumb_draw_bottom)
+				main.g_thumbnail.update_thumbnail_rect(thumb_draw_rect)
 
-		# NOTE: DWM thumbnails are rendered *on top* of anything you draw.
-		# So, drawing a background or border *first* is correct.
+			TIMER_SAVE_WIN_POS.start(hwnd) # Restart the timer to save window position
+			return 0	# do not call DefWindowProc
+		
+		elif msg == win32con.WM_MOVE:
+			# Window has been moved.
+			# lparam: LOWORD is new x position, HIWORD is new y position
+			new_x, new_y = split_lparam_pos(lparam)
+			print(f"PiP window moved to: {new_x}, {new_y}")
 
-		win32gui.EndPaint(hwnd, ps) # Release DC
-		return 0 # calling DefWindowProc is not necessary
+			TIMER_SAVE_WIN_POS.start(hwnd)
+			# NOTE: fall through to run the default window procedure
 
-	elif msg == win32con.WM_SIZE:
-		# Window has been resized.
-		# wparam: Type of resizing (SIZE_MAXIMIZED, SIZE_MINIMIZED, SIZE_RESTORED, etc.)
-		# lparam: LOWORD is new client width, HIWORD is new client height
-		new_client_width, new_client_height = split_lparam_pos(lparam)
-		print(f"PiP window resized to client dimensions: {new_client_width}x{new_client_height}")
-
-		if main.g_thumbnail:
-			# Recalculate thumbnail's destination rectangle based on new client size
-			thumb_draw_top = PIP_PADDING
-			thumb_draw_left = PIP_PADDING
-			thumb_draw_right = max(PIP_PADDING, new_client_width - PIP_PADDING)
-			thumb_draw_bottom = max(PIP_PADDING, new_client_height - PIP_PADDING)
-			thumb_draw_rect = (thumb_draw_left, thumb_draw_top, thumb_draw_right, thumb_draw_bottom)
-			main.g_thumbnail.update_thumbnail_rect(thumb_draw_rect)
-
-		TIMER_SAVE_WIN_POS.start(hwnd) # Restart the timer to save window position
-		return 0	# do not call DefWindowProc
-	
-	elif msg == win32con.WM_MOVE:
-		# Window has been moved.
-		# lparam: LOWORD is new x position, HIWORD is new y position
-		new_x, new_y = split_lparam_pos(lparam)
-		print(f"PiP window moved to: {new_x}, {new_y}")
-
-		TIMER_SAVE_WIN_POS.start(hwnd)
-		# NOTE: fall through to run the default window procedure
-
-	elif msg == win32con.WM_LBUTTONDOWN:
-		click_x, click_y = split_lparam_pos(lparam)
-		if check_within_pip_rect(click_x, click_y):
-			# Left-click to bring the source app to front
-			bring_window_to_front(main.g_source_hwnd)
-		# NOTE: fall through for default processing
-
-	elif msg == win32con.WM_RBUTTONDOWN:
-		# Right-click to close the PiP window
-		screen_x, screen_y = win32gui.ClientToScreen(hwnd, split_lparam_pos(lparam))
-		print(f"Right-click at screen coordinates: {screen_x}, {screen_y}")
-		present_context_menu(hwnd, screen_x, screen_y)
-		# NOTE: fall through for default processing
-	elif msg == win32con.WM_CONTEXTMENU:
-		# Get mouse coordinates in screen coordinates for TrackPopupMenuEx
-		if lparam == -1: # screen_x == 65535 and screen_y == 65535:
-			# If lparam is -1, use the current mouse position
-			screen_x, screen_y = win32api.GetCursorPos()
-		else:
-			screen_x, screen_y = split_lparam_pos(lparam)
-		print(f"Context-menu at screen coordinates: {screen_x}, {screen_y}")
-		present_context_menu(hwnd, screen_x, screen_y)
-		# NOTE: fall through for default processing
-
-	elif msg == win32con.WM_COMMAND:
-		# Handle menu commands
-		cmd_id = win32api.LOWORD(wparam)
-		if cmd_id == MENU_ID_EXIT:
-			win32gui.SendMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-			return 0
-		elif cmd_id == MENU_ID_ABOUT:
-			# Show an about dialog or message box
-			from .version import get_version_info
-			info = get_version_info()
-			about_text = (
-				f"FullThumbs PiP Viewer\n"
-				f"Version: {info['version']}\n"
-				f"Commit: {info['commit_hash_short']}\n"
-				f"Branch: {info['branch']}\n"
-				f"Built: {info['commit_date'][:10]}"  # Just the date part
-			)
-			win32gui.MessageBox(hwnd, about_text, "About FullThumbs", win32con.MB_OK)
-			return 0
-		elif cmd_id == MENU_ID_APP_TO_FRONT:
-			# Bring the source application to the front
-			if main.g_source_hwnd:
+		elif msg == win32con.WM_LBUTTONDOWN:
+			click_x, click_y = split_lparam_pos(lparam)
+			if check_within_pip_rect(click_x, click_y):
+				# Left-click to bring the source app to front
 				bring_window_to_front(main.g_source_hwnd)
+			# NOTE: fall through for default processing
+
+		elif msg == win32con.WM_RBUTTONDOWN:
+			# Right-click to close the PiP window
+			screen_x, screen_y = win32gui.ClientToScreen(hwnd, split_lparam_pos(lparam))
+			print(f"Right-click at screen coordinates: {screen_x}, {screen_y}")
+			present_context_menu(hwnd, screen_x, screen_y)
+			# NOTE: fall through for default processing
+		elif msg == win32con.WM_CONTEXTMENU:
+			# Get mouse coordinates in screen coordinates for TrackPopupMenuEx
+			if lparam == -1: # screen_x == 65535 and screen_y == 65535:
+				# If lparam is -1, use the current mouse position
+				screen_x, screen_y = win32api.GetCursorPos()
 			else:
-				win32gui.MessageBox(hwnd, "No source application found.", "Error", win32con.MB_OK | win32con.MB_ICONERROR)
-			return 0
-		elif cmd_id == MENU_ID_WINDOW_MODE_NORMAL:
-			# Set window to normal mode
-			set_pip_window_style(WINDOW_MODE_NORMAL)
-			return 0
-		elif cmd_id == MENU_ID_WINDOW_MODE_TOPMOST:
-			# Set window to always on top mode
-			set_pip_window_style(WINDOW_MODE_TOPMOST)
-			return 0
-		elif cmd_id == MENU_ID_WINDOW_MODE_MINIMAL:
-			# Set window to minimal mode
-			set_pip_window_style(WINDOW_MODE_MINIMAL)
-			return 0
-		else:
-			print(f"Unhandled command ID: {cmd_id}")
-		# NOTE: do not call DefWindowProc for handled commands
+				screen_x, screen_y = split_lparam_pos(lparam)
+			print(f"Context-menu at screen coordinates: {screen_x}, {screen_y}")
+			present_context_menu(hwnd, screen_x, screen_y)
+			# NOTE: fall through for default processing
 
-	elif msg == win32con.WM_CLOSE:
-		# Handle close message
-		save_window_placement(hwnd)
-		win32gui.DestroyWindow(hwnd)
-		# return 0
-	elif msg == win32con.WM_DESTROY:
-		Timer.stop_all(hwnd)
-		win32gui.PostQuitMessage(0)
-		main.g_pip_hwnd = None
-		# return 0
+		elif msg == win32con.WM_COMMAND:
+			# Handle menu commands
+			cmd_id = win32api.LOWORD(wparam)
+			if cmd_id == MENU_ID_EXIT:
+				win32gui.SendMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+				return 0
+			elif cmd_id == MENU_ID_ABOUT:
+				# Show an about dialog or message box
+				from .version import get_version_info
+				info = get_version_info()
+				about_text = (
+					f"FullThumbs PiP Viewer\n"
+					f"Version: {info['version']}\n"
+					f"Commit: {info['commit_hash_short']}\n"
+					f"Branch: {info['branch']}\n"
+					f"Built: {info['commit_date'][:10]}"  # Just the date part
+				)
+				win32gui.MessageBox(hwnd, about_text, "About FullThumbs", win32con.MB_OK)
+				return 0
+			elif cmd_id == MENU_ID_CHECK_UPDATES:
+				# Check for updates immediately
+				check_for_git_updates()
+				return 0
+			elif cmd_id == MENU_ID_APP_TO_FRONT:
+				# Bring the source application to the front
+				if main.g_source_hwnd:
+					bring_window_to_front(main.g_source_hwnd)
+				else:
+					win32gui.MessageBox(hwnd, "No source application found.", "Error", win32con.MB_OK | win32con.MB_ICONERROR)
+				return 0
+			elif cmd_id == MENU_ID_WINDOW_MODE_NORMAL:
+				# Set window to normal mode
+				set_pip_window_style(WINDOW_MODE_NORMAL)
+				return 0
+			elif cmd_id == MENU_ID_WINDOW_MODE_TOPMOST:
+				# Set window to always on top mode
+				set_pip_window_style(WINDOW_MODE_TOPMOST)
+				return 0
+			elif cmd_id == MENU_ID_WINDOW_MODE_MINIMAL:
+				# Set window to minimal mode
+				set_pip_window_style(WINDOW_MODE_MINIMAL)
+				return 0
+			else:
+				print(f"Unhandled command ID: {cmd_id}")
+			# NOTE: do not call DefWindowProc for handled commands
 
-	return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+		elif msg == win32con.WM_CLOSE:
+			# Handle close message
+			save_window_placement(hwnd)
+			win32gui.DestroyWindow(hwnd)
+			# return 0
+		elif msg == win32con.WM_DESTROY:
+			Timer.stop_all(hwnd)
+			win32gui.PostQuitMessage(0)
+			main.g_pip_hwnd = None
+			# return 0
+
+		return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+	except KeyboardInterrupt:
+		# Handle Ctrl+C gracefully in the window procedure
+		print("KeyboardInterrupt in window procedure. Closing application...")
+		main.g_exit_code = 0  # Set exit code to normal exit
+		win32gui.PostQuitMessage(0)  # Close the message loop
+		return 0
+	except Exception as e:
+		print(f"Error in window procedure: {e}")
+		return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
 # -------
 
