@@ -130,10 +130,10 @@ def present_context_menu(hwnd, screen_x, screen_y):
 	
 	win32gui.AppendMenu(hmenu, win32con.MF_SEPARATOR, 0, "")
 	
-	# Show "Check for Updates" when NOT in debug mode (production or run_loop contexts)
-	# Hide it only in debug mode where git operations don't make sense
-	if not DEBUG_PY:
-		win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_CHECK_UPDATES, "Check for Updates")
+	# Always show "Check for Updates" but grey it out in debug mode
+	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_CHECK_UPDATES, "Check for Updates")
+	if DEBUG_PY:
+		win32gui.EnableMenuItem(hmenu, MENU_ID_CHECK_UPDATES, win32con.MF_GRAYED)
 	
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_ABOUT, "About...")
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_EXIT, "Exit PiP")
@@ -333,6 +333,7 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 			elif cmd_id == MENU_ID_ABOUT:
 				# Show an about dialog or message box
 				from .version import get_version_info
+				from .constants import DEBUG_PY
 				info = get_version_info()
 				about_text = (
 					f"FullThumbs PiP Viewer\n"
@@ -341,6 +342,8 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 					f"Branch: {info['branch']}\n"
 					f"Built: {info['commit_date'][:10]}"  # Just the date part
 				)
+				if DEBUG_PY:
+					about_text += "\n\n🐛 Debug Mode Active"
 				win32gui.MessageBox(hwnd, about_text, "About FullThumbs", win32con.MB_OK)
 				return 0
 			elif cmd_id == MENU_ID_CHECK_UPDATES:

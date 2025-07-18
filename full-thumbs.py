@@ -69,20 +69,25 @@ Note: Auto-update intervals must be at least {minimum_interval}.
 	run_parser.add_argument('--debug-simulate-update', action='store_true',
 							help='Debug mode: simulate finding updates and request restart')
 	
+	# Force reinstall subcommand
+	reinstall_parser = subparsers.add_parser(
+		'force-reinstall',
+		help='Force re-install from git repository (DESTRUCTIVE: resets source files, preserves settings and venv)'
+	)
+	reinstall_parser.add_argument('--yes', action='store_true',
+								  help='Confirm the destructive operation without prompting')
+	
 	# Auto-update arguments for main command (when no subcommand is used)
 	auto_group = parser.add_mutually_exclusive_group()
 	auto_group.add_argument('--auto-update', nargs='?', const='default', metavar='INTERVAL',
-							help=f'Enable auto-updates with optional interval (default: {default_interval}, special values: "default", "minimum")')
+			help=f'Enable auto-updates with optional interval (default: {default_interval},'
+				f' special values: "default", "minimum")')
 	auto_group.add_argument('--no-auto-update', action='store_true',
-							help='Disable auto-updates completely')
+			help='Disable auto-updates completely')
 	
 	# Debug override option
 	parser.add_argument('--debug-loop', action='store_true',
-						help='Debug the production restart loop with git updates disabled')
-	
-	# Recovery option
-	parser.add_argument('--force-reinstall', action='store_true',
-						help='Force re-install from git repository (resets source files, preserves settings and venv)')
+			help='Debug the production restart loop with git updates disabled')
 	
 	return parser.parse_args()
 
@@ -92,6 +97,36 @@ def check_for_updates():
 	"""Check for git updates and pull if available."""
 	try:
 		repo_dir = os.path.dirname(os.path.abspath(__file__))
+		
+		# Get the current commit hash to detect manual updates
+		current_commit = subprocess.run(
+			['git', 'rev-parse', 'HEAD'],
+			cwd=repo_dir,
+			capture_output=True,
+			text=True,
+			check=True
+		).stdout.strip()
+		
+		# Check if the commit has changed since last check (indicating manual update)
+		last_commit = getattr(check_for_updates, '_last_commit', None)
+		if last_commit and last_commit != current_commit:
+			print("Installation appears to have been updated manually - triggering restart to refresh application...")
+			check_for_updates._last_commit = current_commit
+			return True  # Trigger restart/update cycle
+		
+		# Store the current commit for next check
+		check_for_updates._last_commit = current_commit
+		
+		# Check working directory status
+		status_result = subprocess.run(
+			['git', 'status', '--porcelain'],
+			cwd=repo_dir,
+			capture_output=True,
+			text=True,
+			check=True
+		)
+		
+		has_uncommitted_changes = bool(status_result.stdout.strip())
 		
 		# Fetch latest changes from remote
 		print("Checking for updates...")
@@ -110,22 +145,27 @@ def check_for_updates():
 		if commits_behind > 0:
 			print(f"Found {commits_behind} new commit(s). Updating...")
 			
-			# Check if working directory is clean
-			status_result = subprocess.run(
-				['git', 'status', '--porcelain'],
-				cwd=repo_dir,
-				capture_output=True,
-				text=True,
-				check=True
-			)
-			
-			if status_result.stdout.strip():
+			if has_uncommitted_changes:
 				print("WARNING: Working directory has uncommitted changes. Skipping update.")
+				# This indicates potential corruption - show notification
+				try:
+					from src.notifications import show_corruption_notification
+					show_corruption_notification()
+				except ImportError:
+					print("⚠️  Installation corruption detected - use 'python full-thumbs.py force-reinstall' to recover")
 				return False
 			
 			# Pull the latest changes
 			subprocess.run(['git', 'pull'], cwd=repo_dir, check=True)
 			print("Update complete! Restarting application...")
+			# Update our stored commit hash since we just pulled
+			check_for_updates._last_commit = subprocess.run(
+				['git', 'rev-parse', 'HEAD'],
+				cwd=repo_dir,
+				capture_output=True,
+				text=True,
+				check=True
+			).stdout.strip()
 			return True
 		else:
 			print("Application is up to date.")
@@ -133,15 +173,54 @@ def check_for_updates():
 			
 	except subprocess.CalledProcessError as e:
 		print(f"Git operation failed: {e}")
+		# Git operation failure might indicate corruption
+		try:
+			from src.notifications import show_corruption_notification
+			show_corruption_notification()
+		except ImportError:
+			print("⚠️  Installation corruption detected - use 'python full-thumbs.py force-reinstall' to recover")
 		return False
 	except Exception as e:
 		print(f"Error checking for updates: {e}")
 		return False
 
-def reinstall_from_git():
+def reinstall_from_git(confirmed=False):
 	"""Re-install from git repository, resetting source files while preserving settings and venv."""
 	try:
 		repo_dir = os.path.dirname(os.path.abspath(__file__))
+		
+		# First, check what would be affected
+		print("Checking repository status...")
+		status_result = subprocess.run(
+			['git', 'status', '--porcelain'],
+			cwd=repo_dir,
+			capture_output=True,
+			text=True,
+			check=True
+		)
+		
+		if not confirmed:
+			if status_result.stdout.strip():
+				print("\n⚠️  WARNING: DESTRUCTIVE OPERATION ⚠️")
+				print("This will permanently reset ALL source files to the git repository state.")
+				print("The following will be PRESERVED:")
+				print("  • Settings files (*.json)")
+				print("  • Virtual environment (.venv/, venv/)")
+				print("  • User data and configurations")
+				
+				print("\nThe following files will be LOST:")
+				for line in status_result.stdout.strip().split('\n'):
+					status_code = line[:2]
+					file_path = line[3:] if len(line) > 3 else line
+					if status_code.strip():
+						print(f"  • {file_path}")
+				
+				print("\nTo proceed with this destructive operation, run:")
+				print("  python full-thumbs.py force-reinstall --yes")
+				return False
+			else:
+				print("No modified files detected - proceeding with reinstall...")
+				# No changes to lose, so we can proceed without confirmation
 		
 		print("Re-installing from git repository...")
 		print("This will reset all source files to the repository state.")
@@ -151,33 +230,18 @@ def reinstall_from_git():
 		print("\n1. Fetching latest changes...")
 		subprocess.run(['git', 'fetch'], cwd=repo_dir, check=True, capture_output=True)
 		
-		# Show current status
-		print("\n2. Checking current repository status...")
-		status_result = subprocess.run(
-			['git', 'status', '--porcelain'],
-			cwd=repo_dir,
-			capture_output=True,
-			text=True,
-			check=True
-		)
-		
-		if status_result.stdout.strip():
-			print("Modified files will be reset:")
-			for line in status_result.stdout.strip().split('\n'):
-				print(f"  {line}")
-		
 		# Reset all tracked files to HEAD
-		print("\n3. Resetting source files to repository state...")
+		print("\n2. Resetting source files to repository state...")
 		subprocess.run(['git', 'reset', '--hard', 'HEAD'], cwd=repo_dir, check=True)
 		
 		# Clean untracked files (but preserve important ones)
-		print("\n4. Cleaning untracked files (preserving settings and venv)...")
+		print("\n3. Cleaning untracked files (preserving settings and venv)...")
 		# Remove untracked files except for settings and venv
 		subprocess.run(['git', 'clean', '-fd', '--exclude=*.json', '--exclude=.venv/', '--exclude=venv/'], 
 					  cwd=repo_dir, check=True)
 		
 		# Pull latest changes
-		print("\n5. Pulling latest changes...")
+		print("\n4. Pulling latest changes...")
 		subprocess.run(['git', 'pull'], cwd=repo_dir, check=True)
 		
 		print("\n✅ Re-installation complete!")
@@ -306,20 +370,20 @@ def run_loop(args):
 if __name__ == "__main__":
 	args = parse_arguments()
 	
-	# Handle force reinstall command
-	if args.force_reinstall:
+	# Handle force reinstall subcommand
+	if args.command == 'force-reinstall':
 		# Prevent reinstall in debug mode to protect development environment
 		if constants.DEBUG_PY:
 			print("❌ Force reinstall is disabled in debug mode to protect the development environment.")
 			print("To reinstall, run the application outside of the debugger.")
 			sys.exit(1)
 		
-		if reinstall_from_git():
+		confirmed = getattr(args, 'yes', False)
+		success = reinstall_from_git(confirmed)
+		if success:
 			print("\nApplication has been re-installed successfully.")
 			print("You can now run the application normally.")
-		else:
-			print("\nRe-installation failed. Please check the error messages above.")
-		sys.exit(0)
+		sys.exit(0 if success else 1)
 	
 	# Check if we should enable debug loop mode
 	debug_loop = getattr(args, 'debug_loop', False)

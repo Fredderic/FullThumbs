@@ -23,6 +23,8 @@ and comprehensive command-line options.
 - Python 3.x
 - Required Python packages:
   - `pywin32` - Windows API bindings
+- Optional Python packages:
+  - `plyer` - Enhanced toast notifications (fallback to PowerShell if not available)
 
 ## Installation
 
@@ -165,17 +167,35 @@ python full-thumbs.py --no-auto-update
 If your installation becomes corrupted or you need to reset to a clean state:
 
 ```bash
+# Check what would be affected (or proceed automatically if no changes)
+python full-thumbs.py force-reinstall
+
 # Force reinstall from git repository (DESTRUCTIVE)
-python full-thumbs.py --force-reinstall
+python full-thumbs.py force-reinstall --yes
 ```
 
-**⚠️ Warning**: The `--force-reinstall` option is destructive and will:
+**⚠️ Warning**: The `force-reinstall` command is destructive and will:
 - Reset all source files to the git repository state
 - Remove any local modifications to code files
 - Preserve settings files (JSON) and virtual environment
 - Disabled in debug mode to protect development environments
 
-Use this option only when you need to recover from a corrupted installation.
+If no local changes are detected, the operation will proceed automatically. If changes would be lost, the command will show you what files would be affected and require you to run it again with `--yes` to confirm the destructive operation.
+
+## Notifications
+
+FullThumbs includes a smart notification system that alerts you when automatic updates fail due to installation corruption:
+
+- **Toast notifications**: Uses Windows 10/11 native toast notifications when possible
+- **Fallback support**: Falls back to PowerShell notifications if optional dependencies aren't available
+- **Once per session**: Shows corruption notifications only once per application session to avoid spam
+- **Auto-recovery detection**: Detects when installation is manually updated (via git pull, force-reinstall, etc.) and triggers automatic restart
+- **Non-intrusive**: Only shows notifications when there's actually a problem that needs attention
+
+To test the notification system:
+```bash
+python test_notifications.py
+```
 
 ## Configuration
 

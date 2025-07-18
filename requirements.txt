@@ -1,1 +1,4 @@
 pywin32>=306
+
+# Optional: Enhanced toast notifications (fallback to PowerShell if not available)
+plyer>=2.0; sys_platform == "win32"
