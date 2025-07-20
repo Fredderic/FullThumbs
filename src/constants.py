@@ -22,3 +22,9 @@ PIP_PADDING = 10
 # Auto-update settings
 MIN_UPDATE_INTERVAL_MS = 60_000					# 60 seconds minimum
 DEFAULT_UPDATE_INTERVAL_MS = 4 * 60 * 60_000	# 4 hours default
+
+# About dialog constants	-- FIXME : probably shouldn't be here
+ABOUT_TEXT = """FullThumbs v1.0\n
+A Windows utility for showing a window thumbnail.\n
+Created with Python and Win32 APIs."""
+GITHUB_LINK = "https://github.com/Fredderic/FullThumbs"
