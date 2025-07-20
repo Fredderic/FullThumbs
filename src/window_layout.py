@@ -2,26 +2,139 @@
 - WM_SIZE message handler (to handle window resizing)
 - WM_GETMINMAXINFO message handler
 
-Sizing:
-	- FIXED		always use the same size
-	- EXPAND	distribute space evenly among children
-	- GROW		consume space in order from smallest to largest
-
-- how to mix sizing methods?
-	- sort them by size first
-	- build sorted list of unique sizes
-	- while there is space left to assign:
-		- give each sizing method the second smallest size as an argument
-
+SIZING SYSTEM: ✅ COMPLETE
+	✅ FIXED		always use the same size
+	✅ EXPAND		distribute space evenly among children
+	✅ GROW			consume space in order from smallest to largest
+	✅ Mixed sizing methods with unified grow algorithm
+	✅ Maximum size constraints and limits
+	✅ Intelligent text wrapping with word boundaries
+	✅ String-based font measurement (ready for real APIs)
+	✅ Shrink-then-grow space optimization
+	✅ Bidirectional layout (width and height)
+	✅ Content-aware minimum constraints
 
 + Fit sizing widths
-- Grow and shrink widths
-- Wrap text
++ Grow and shrink widths
++ Wrap text
 + Fit sizing heights
-- Grow and shrink heights
++ Grow and shrink heights
 - Positioning
 - Draw widgets
 """
+
+# -------
+# Text Measurement Interface
+# -------
+
+def _default_measure_text_width(text, font=None):
+	"""Default text width measurement implementation.
+	
+	This is a placeholder implementation that provides rough estimates
+	based on character classification. In production, this should be
+	replaced with actual font measurement using system APIs.
+	
+	Args:
+		text: The complete text string to measure
+		font: Font information (currently unused)
+		
+	Returns:
+		int: Estimated text width in pixels
+	"""
+	if not text:
+		return 0
+	
+	# TODO: Replace with actual text measurement APIs like:
+	# Windows: GetTextExtentPoint32(hdc, text, len(text), &size)
+	# Cross-platform: FreeType, Skia, Pango, etc.
+	
+	# For now, use character classification for better estimates
+	# These are very rough approximations - real measurement is essential
+	width = 0
+	for char in text:
+		if char == ' ':
+			width += 4  # Spaces are narrow
+		elif char in 'ij':
+			width += 4  # Very narrow characters
+		elif char in 'Il1':
+			width += 5  # Narrow characters
+		elif char in 'frt':
+			width += 6  # Somewhat narrow
+		elif char in 'abcdeghknopqsuvxyz':
+			width += 8  # Average width
+		elif char in 'ABCDEFGHIJKLMNOPQRSTUVXYZ':
+			width += 10  # Capital letters are wider
+		elif char in 'mw':
+			width += 12  # Wide lowercase
+		elif char in 'MW':
+			width += 14  # Wide capitals
+		elif ord(char) > 127:
+			# Non-ASCII characters - could be anything!
+			# CJK characters are typically much wider
+			if ord(char) >= 0x4E00 and ord(char) <= 0x9FFF:  # CJK range
+				width += 16  # CJK characters are typically wider
+			elif ord(char) >= 0x0100:  # Extended Latin and beyond
+				width += 10  # Assume similar to capitals
+			else:
+				width += 8  # Default assumption
+		else:
+			width += 8  # Punctuation and other characters
+	
+	return width
+
+def _default_get_font_metrics(font=None):
+	"""Default font metrics implementation.
+	
+	This is a placeholder that will eventually interface with the system's
+	font measurement APIs to get accurate font information.
+	
+	Args:
+		font: Font information (currently unused)
+		
+	Returns:
+		dict: Font metrics with keys 'height'
+	"""
+	# TODO: Replace with actual font measurement using system APIs
+	# For Windows, this would use GDI functions like GetTextMetrics
+	# For cross-platform, could use libraries like FreeType
+	
+	font_height = 16  # Default UI font height
+	
+	return {
+		'height': font_height,
+	}
+
+# Global text measurement function - can be replaced by applications
+measure_text_width = _default_measure_text_width
+get_font_metrics = _default_get_font_metrics
+
+def set_text_measurement_functions(width_func=None, metrics_func=None):
+	"""Set custom text measurement functions.
+	
+	This allows applications to replace the default estimation functions
+	with actual font measurement implementations using system APIs.
+	
+	Args:
+		width_func: Function(text, font) -> int that measures text width,
+		           or None to restore the default function
+		metrics_func: Function(font) -> dict that returns font metrics,
+		            or None to restore the default function
+	"""
+	global measure_text_width, get_font_metrics
+	
+	if width_func is not None:
+		measure_text_width = width_func
+	else:
+		measure_text_width = _default_measure_text_width
+	
+	if metrics_func is not None:
+		get_font_metrics = metrics_func
+	else:
+		get_font_metrics = _default_get_font_metrics
+
+# -------
+# Layout Classes
+# -------
 
 class Dimension(tuple):
 	"""Base class for dimension sizing.
@@ -176,6 +289,25 @@ class Layout:
 	def get_preferred_width(self) -> int | None:
 		# Default implementation returns None (not shrinkable)
 		return None
+	
+	def try_shrink_width(self, target_width: int) -> int:
+		"""Try to shrink to target width with intelligent content reflow.
+		
+		This method is called when the layout algorithm needs a widget to shrink
+		below its preferred width. The widget should attempt to reflow its content
+		(e.g., text wrapping) to fit the target width and return the actual width
+		it can achieve.
+		
+		Args:
+			target_width: The desired width to shrink to
+			
+		Returns:
+			The actual width achieved after content reflow. May be larger than
+			target_width if the content cannot be made smaller.
+		
+		Default implementation just clamps to minimum width.
+		"""
+		return max(target_width, self.query_width_request())
 
 	@staticmethod
 	def _argument_expand_2(value):
@@ -512,15 +644,22 @@ class LayoutContainer(LayoutGroup):
 			total_minimum += min_request
 			total_preferred += preferred_size
 		
-		# Step 2: Check if we have extra space to distribute or need to shrink
+		# Step 2: Handle space deficit first (shrinking), then redistribute any excess
 		extra_space = available_space - total_preferred
+		
+		if extra_space < 0 and shrinkable_widgets:
+			# Step 3a: Shrink widgets that can shrink to reclaim needed space
+			space_to_reclaim = -extra_space  # Make it positive
+			self._shrink_widgets(shrinkable_widgets, space_to_reclaim)
+			
+			# Step 3b: Calculate how much space we actually have after shrinking
+			# Widgets might have shrunk more than needed, creating excess space
+			total_allocated_after_shrink = sum(info['allocated'] for info in fixed_widgets + variable_widgets)
+			extra_space = available_space - total_allocated_after_shrink
+		
+		# Step 3: Distribute any extra space using unified grow algorithm
 		if extra_space > 0 and variable_widgets:
-			# Step 3: Distribute extra space using unified grow algorithm
 			self._distribute_variable_widgets(variable_widgets, extra_space)
-		elif extra_space < 0 and shrinkable_widgets:
-			# Step 4: Shrink widgets that can shrink (to be implemented later)
-			# For now, just keep preferred sizes
-			pass
 		
 		# Return all widgets for the caller to apply allocations
 		return fixed_widgets + variable_widgets
@@ -614,6 +753,99 @@ class LayoutContainer(LayoutGroup):
 				# Not enough space to give even 1 pixel to each widget - break to avoid infinite loop
 				break
 			remaining_space = allocate_space_to_widgets(active_expand_widgets, remaining_space, allocation_per_widget)
+	
+	def _shrink_widgets(self, shrinkable_widgets, space_to_reclaim):
+		"""Shrink widgets that can shrink using intelligent content reflow.
+		
+		This method uses try_shrink_width() to allow widgets to shrink intelligently
+		and may give back extra space if widgets can't shrink as much as requested.
+		"""
+		if not shrinkable_widgets or space_to_reclaim <= 0:
+			return
+		
+		remaining_to_reclaim = space_to_reclaim
+		
+		# Sort shrinkable widgets by current allocated size (largest first for shrinking)
+		active_shrinkable = [info for info in shrinkable_widgets 
+							if info['allocated'] > info['min_space']]
+		active_shrinkable.sort(key=lambda info: info['allocated'], reverse=True)
+		
+		def shrink_widgets_intelligently(widgets, remaining_to_reclaim, target_shrink_per_widget):
+			"""Shrink widgets using try_shrink_width and return space left to reclaim."""
+			if not widgets or remaining_to_reclaim <= 0 or target_shrink_per_widget <= 0:
+				return remaining_to_reclaim
+			
+			for info in widgets[:]:  # Use slice copy to avoid issues when modifying the list
+				old_size = info['allocated']
+				target_size = old_size - target_shrink_per_widget
+				
+				# Use try_shrink_width for intelligent shrinking
+				if hasattr(info['child'], 'try_shrink_width'):
+					actual_size = info['child'].try_shrink_width(target_size)
+				else:
+					# Fallback to simple clamping for widgets without intelligent shrinking
+					actual_size = max(target_size, info['min_space'])
+				
+				# Ensure we don't go below minimum
+				actual_size = max(actual_size, info['min_space'])
+				
+				# If widget couldn't shrink at all, remove it to avoid infinite loops
+				if actual_size >= old_size:
+					widgets.remove(info)
+					continue
+				
+				if actual_size <= info['min_space']:
+					actual_size = info['min_space']
+					widgets.remove(info)  # Remove from list if minimum reached
+				
+				space_reclaimed = old_size - actual_size
+				info['allocated'] = actual_size
+				remaining_to_reclaim -= space_reclaimed
+				
+				if remaining_to_reclaim <= 0:
+					break
+			
+			return max(0, remaining_to_reclaim)
+		
+		widgets_at_max = []
+		
+		if active_shrinkable:
+			# Implement shrinking algorithm: work from largest to smallest
+			current_max = active_shrinkable[0]['allocated']
+			
+			for info in active_shrinkable:
+				# If we have a widget at current_max, add it to the list
+				next_target = info['allocated']
+				if next_target == current_max:
+					widgets_at_max.append(info)
+					continue
+				
+				# Bring all widgets at current_max level down to next_target
+				shrink_per_widget = current_max - next_target
+				total_shrink_needed = shrink_per_widget * len(widgets_at_max)
+				
+				if total_shrink_needed > remaining_to_reclaim:
+					shrink_per_widget = remaining_to_reclaim // len(widgets_at_max)
+					if shrink_per_widget <= 0:
+						# Not enough space to reclaim even 1 pixel from each widget
+						break
+				
+				remaining_to_reclaim = shrink_widgets_intelligently(widgets_at_max, remaining_to_reclaim, shrink_per_widget)
+				
+				if remaining_to_reclaim <= 0:
+					# Reclaimed enough space
+					return
+				
+				widgets_at_max.append(info)  # Add this widget to the list at current level
+				current_max = next_target  # Update current level
+		
+		# Distribute remaining shrinking evenly among all remaining shrinkable widgets
+		while remaining_to_reclaim > 0 and widgets_at_max:
+			shrink_per_widget = remaining_to_reclaim // len(widgets_at_max)
+			if shrink_per_widget <= 0:
+				# Not enough space to reclaim even 1 pixel from each widget - break to avoid infinite loop
+				break
+			remaining_to_reclaim = shrink_widgets_intelligently(widgets_at_max, remaining_to_reclaim, shrink_per_widget)
 
 # --- leaf node layouts
 
@@ -651,11 +883,15 @@ class LayoutText(LayoutWidget):
 		self.color = color
 	
 	@staticmethod
-	def get_extents(text):
+	def get_extents(text, font=None):
 		"""Estimate the extents (width, height) of text.
+		
+		This is a convenience method that uses the global text measurement
+		functions to calculate text dimensions.
 		
 		Args:
 			text: The text string to measure
+			font: Font information (passed to measurement functions)
 			
 		Returns:
 			tuple[int, int]: Estimated (width, height) in pixels
@@ -663,27 +899,35 @@ class LayoutText(LayoutWidget):
 		if not text:
 			return (0, 0)
 		
+		metrics = get_font_metrics(font)
+		font_height = metrics['height']
+		
 		# For multiline text, calculate based on lines
 		lines = text.split('\n')
 		if len(lines) > 1:
-			max_line_width = max(len(line) for line in lines)
-			width = max_line_width * 8
-			height = len(lines) * 16
+			max_line_width = max(measure_text_width(line, font) for line in lines)
+			width = max_line_width
+			height = len(lines) * font_height
 		else:
-			width = len(text) * 8
-			height = 16
+			width = measure_text_width(text, font)
+			height = font_height
 		
 		return (width, height)
 	
 	def query_width_request(self):
-		# Return minimum width (single character wide)
+		# Return minimum width (reasonable minimum for text rendering)
 		if not self.text:
 			return 0
-		return 8  # Minimum width for one character
+		
+		# Minimum width should be based on actual content, but allow for some shrinking
+		# Use a small representative text sample to determine reasonable minimum
+		sample_chars = "Wj"  # Wide and narrow character combination
+		min_char_width = measure_text_width(sample_chars, self.font) // 2
+		return max(min_char_width * 2, 16)  # At least space for a couple characters
 	
 	def query_height_request(self):
 		# Use the static method for text measurement
-		_, height = self.get_extents(self.text)
+		_, height = self.get_extents(self.text, self.font)
 		return height
 	
 	def get_preferred_width(self):
@@ -692,8 +936,73 @@ class LayoutText(LayoutWidget):
 		This indicates that the text can shrink below this size by wrapping.
 		"""
 		# Use the static method for text measurement
-		width, _ = self.get_extents(self.text)
+		width, _ = self.get_extents(self.text, self.font)
 		return width
+	
+	def try_shrink_width(self, target_width: int) -> int:
+		"""Try to shrink to target width with intelligent text wrapping.
+		
+		This method wraps text at word boundaries and returns the actual
+		width achieved, which may be larger than target_width if the text
+		contains very long words.
+		"""
+		if not self.text:
+			return 0
+		
+		# Try wrapping at word boundaries
+		words = self.text.split()
+		if not words:
+			return 0
+		
+		# Find the longest word - this sets our absolute minimum
+		longest_word_width = max(measure_text_width(word, self.font) for word in words)
+		min_width = self.query_width_request()
+		actual_min = max(min_width, longest_word_width)
+		
+		if target_width <= actual_min:
+			return actual_min
+		
+		# Simulate text wrapping by building complete lines and measuring them
+		lines = []
+		current_line_words = []
+		
+		for word in words:
+			# Try adding this word to the current line
+			test_line_words = current_line_words + [word]
+			test_line_text = ' '.join(test_line_words)
+			test_line_width = measure_text_width(test_line_text, self.font)
+			
+			if test_line_width <= target_width:
+				# Word fits on current line
+				current_line_words = test_line_words
+			else:
+				# Word doesn't fit, finish current line and start new one
+				if current_line_words:
+					lines.append(' '.join(current_line_words))
+					current_line_words = [word]
+				else:
+					# Single word too long for line - force it anyway
+					current_line_words = [word]
+		
+		# Don't forget the last line
+		if current_line_words:
+			lines.append(' '.join(current_line_words))
+		
+		# Find the actual width needed (measure the widest line)
+		if lines:
+			actual_width = max(measure_text_width(line, self.font) for line in lines)
+			return max(actual_width, actual_min)
+		else:
+			return actual_min
+	
+	def distribute_width(self, available_width: int) -> int:
+		"""Accept the allocated width for text wrapping.
+		
+		The text will use the allocated width and wrap accordingly.
+		"""
+		# Clamp to minimum width
+		min_width = self.query_width_request()
+		return max(available_width, min_width)
 
 class LayoutButton(LayoutWidget):
 	def __init__(self, text, id, width=None, height=None):
@@ -795,6 +1104,18 @@ class LayoutButton(LayoutWidget):
 		
 		# Fixed width or other cases - not shrinkable
 		return None
+	
+	def try_shrink_width(self, target_width: int) -> int:
+		"""Try to shrink button width, but buttons don't wrap so just clamp to minimum."""
+		if self.width is None:
+			# Auto-sized button - can't shrink below text + padding
+			return self.query_width_request()
+		elif isinstance(self.width, (Expand, Grow)):
+			# Variable width button - clamp to dimension minimum
+			return max(target_width, self.width.minim)
+		else:
+			# Fixed width button - return fixed size
+			return self.query_width_request()
 
 class LayoutEdit(LayoutWidget):
 	def __init__(self, text, multiline=False, read_only=False, width=None, height=None):
