@@ -278,12 +278,10 @@ class Layout:
 	RIGHT = END
 	
 	def __init__(self):
-		# Store computed sizes from distribution
-		self._computed_width = None
-		self._computed_height = None
-		# Store computed positions from positioning
-		self._computed_x = None
-		self._computed_y = None
+		# Store computed sizes and positions as arrays for easy axis indexing
+		# [width, height] and [x, y] - allows using [axis] and [1-axis] patterns
+		self._computed_size: list[int | None] = [None, None]  # [width, height]
+		self._computed_pos: list[int | None] = [None, None]   # [x, y]
 	
 	def query_width_request(self) -> int:
 		# Default implementation returns 0
@@ -300,26 +298,28 @@ class Layout:
 	def distribute_width(self, available_width: int) -> int:
 		# Default implementation returns the query width (no distribution)
 		width = self.query_width_request()
-		self._computed_width = width
+		self._computed_size[0] = width  # Store in array position 0 (width)
 		return width
 	
 	def distribute_height(self, available_height: int) -> int:
 		# Default implementation returns the query height (no distribution)
 		height = self.query_height_request()
-		self._computed_height = height
+		self._computed_size[1] = height  # Store in array position 1 (height)
 		return height
 	
 	def get_computed_width(self) -> int | None:
 		"""Get the computed width from the last distribution pass."""
-		return self._computed_width
+		return self._computed_size[0]
 	
 	def get_computed_height(self) -> int | None:
 		"""Get the computed height from the last distribution pass."""
-		return self._computed_height
+		return self._computed_size[1]
 	
-	def get_computed_size(self) -> tuple[int | None, int | None]:
-		"""Get the computed size (width, height) from the last distribution pass."""
-		return (self._computed_width, self._computed_height)
+	def get_computed_size(self, axis=None):
+		"""Get computed size. If axis specified, return size for that axis, otherwise return (width, height) tuple."""
+		if axis is None:
+			return (self._computed_size[0], self._computed_size[1])
+		return self._computed_size[axis]
 	
 	def position_at(self, x: int, y: int) -> None:
 		"""Position this widget at the specified coordinates.
@@ -331,24 +331,26 @@ class Layout:
 			x: The x-coordinate (left edge) of the widget
 			y: The y-coordinate (top edge) of the widget
 		"""
-		self._computed_x = x
-		self._computed_y = y
+		self._computed_pos[0] = x  # Store in array position 0 (x)
+		self._computed_pos[1] = y  # Store in array position 1 (y)
 	
 	def get_computed_x(self) -> int | None:
 		"""Get the computed x position from the last positioning pass."""
-		return self._computed_x
+		return self._computed_pos[0]
 	
 	def get_computed_y(self) -> int | None:
 		"""Get the computed y position from the last positioning pass."""
-		return self._computed_y
+		return self._computed_pos[1]
 	
-	def get_computed_position(self) -> tuple[int | None, int | None]:
-		"""Get the computed position (x, y) from the last positioning pass."""
-		return (self._computed_x, self._computed_y)
+	def get_computed_position(self, axis=None):
+		"""Get computed position. If axis specified, return position for that axis, otherwise return (x, y) tuple."""
+		if axis is None:
+			return (self._computed_pos[0], self._computed_pos[1])
+		return self._computed_pos[axis]
 	
 	def get_computed_rect(self) -> tuple[int | None, int | None, int | None, int | None]:
 		"""Get the computed rectangle (x, y, width, height) from the last layout passes."""
-		return (self._computed_x, self._computed_y, self._computed_width, self._computed_height)
+		return (self._computed_pos[0], self._computed_pos[1], self._computed_size[0], self._computed_size[1])
 	
 	def layout(self, x: int, y: int, width: int, height: int) -> tuple[int, int]:
 		"""Perform complete layout: size distribution and positioning.
@@ -457,7 +459,7 @@ class LayoutSingle(Layout):
 		# Pass through width distribution to child
 		if self.child:
 			width = self.child.distribute_width(available_width)
-			self._computed_width = width
+			self._computed_size[0] = width
 			return width
 		return super().distribute_width(available_width)
 	
@@ -465,7 +467,7 @@ class LayoutSingle(Layout):
 		# Pass through height distribution to child
 		if self.child:
 			height = self.child.distribute_height(available_height)
-			self._computed_height = height
+			self._computed_size[1] = height
 			return height
 		return super().distribute_height(available_height)
 	
@@ -512,12 +514,12 @@ class LayoutPadding(LayoutSingle):
 			if child_width > 0:
 				actual_child_width = self.child.distribute_width(child_width)
 				width = actual_child_width + width_padding
-				self._computed_width = width
+				self._computed_size[0] = width
 				return width
 		
 		# If no child or no space, return just the padding
 		width = width_padding
-		self._computed_width = width
+		self._computed_size[0] = width
 		return width
 	
 	def distribute_height(self, available_height: int) -> int:
@@ -530,12 +532,12 @@ class LayoutPadding(LayoutSingle):
 			if child_height > 0:
 				actual_child_height = self.child.distribute_height(child_height)
 				height = actual_child_height + height_padding
-				self._computed_height = height
+				self._computed_size[1] = height
 				return height
 		
 		# If no child or no space, return just the padding
 		height = height_padding
-		self._computed_height = height
+		self._computed_size[1] = height
 		return height
 	
 	def position_at(self, x: int, y: int) -> None:
@@ -588,42 +590,83 @@ class LayoutContainer(LayoutGroup):
 		# gap can be int/float for spacing, or a callable that returns Layout widgets
 		return cls(axis=LayoutGroup.HORIZONTAL, align=align, gap=gap, children=children)
 	
-	def _get_children_with_gaps(self):
-		"""Return children with gaps inserted between them."""
-		# Return cached result if available
-		if self._children_with_gaps_cache is not None:
-			return self._children_with_gaps_cache
+	def _get_gap_info(self):
+		"""Analyze the gap configuration and return gap handling strategy.
 		
+		Returns:
+			dict with keys:
+			- 'type': 'simple' or 'widget'
+			- 'size': For simple gaps, the numeric size (may be 0)
+			- 'builder': For widget gaps, the builder function
+			- 'total_simple_gap': Total space needed for simple gaps
+		"""
 		if not self.children or len(self.children) <= 1:
-			self._children_with_gaps_cache = self.children
-			return self._children_with_gaps_cache
+			return {'type': 'simple', 'size': 0, 'builder': None, 'total_simple_gap': 0}
 		
-		# Determine the gap builder function
-		if callable(self.gap):
-			# gap is a builder function
-			gap_builder = self.gap
-		elif self.gap > 0:
-			# gap is a number - create default spacer builder
+		gap_count = len(self.children) - 1
+		gap_value = self.gap
+		
+		# Handle Fixed dimensions by reducing to numeric value
+		if isinstance(gap_value, Fixed):
+			# Reduce Fixed dimension to its numeric value
+			gap_value = gap_value.minim
+		
+		if callable(gap_value):
+			# gap is a builder function - use widget-based gaps
+			return {'type': 'widget', 'size': 0, 'builder': gap_value, 'total_simple_gap': 0}
+		elif gap_value is None:
+			# None is an alias for 0 - use simple gaps with size 0
+			gap_value = 0
+		
+		if isinstance(gap_value, (int, float)):
+			# gap is a simple number - use optimized simple gaps
+			if gap_value >= 0:
+				total_gap = gap_count * gap_value
+				return {'type': 'simple', 'size': gap_value, 'builder': None, 'total_simple_gap': total_gap}
+			else:
+				# Negative gap value - raise error for explicit handling
+				raise ValueError(f"Gap size cannot be negative: {gap_value}")
+		elif isinstance(self.gap, (Expand, Grow)):
+			# Expand/Grow dimension gap - use widget-based gaps with LayoutSpacer
 			if self.axis == LayoutGroup.HORIZONTAL:
 				gap_builder = lambda: LayoutSpacer(width=self.gap, height=0)
 			else:  # LayoutGroup.VERTICAL
 				gap_builder = lambda: LayoutSpacer(width=0, height=self.gap)
+			return {'type': 'widget', 'size': 0, 'builder': gap_builder, 'total_simple_gap': 0}
 		else:
-			gap_builder = None
+			# Unknown gap type - raise error for explicit handling
+			raise TypeError(f"Unsupported gap type: {type(self.gap).__name__}. "
+							f"Gap must be a number, Fixed/Expand/Grow dimension, or callable.")
+	
+	def _get_children_with_gaps(self):
+		"""Return children with gaps inserted between them.
 		
-		# If no gaps needed, return children as-is
-		if not gap_builder:
+		For simple numeric gaps (including size 0), this returns just the children (gaps handled in positioning).
+		For widget-based gaps, this returns children with LayoutSpacer widgets inserted.
+		"""
+		# Return cached result if available
+		if self._children_with_gaps_cache is not None:
+			return self._children_with_gaps_cache
+		
+		gap_info = self._get_gap_info()
+		
+		if gap_info['type'] == 'simple':
+			# Simple gaps (including size 0) - return children as-is (gaps handled in positioning)
 			self._children_with_gaps_cache = self.children
 			return self._children_with_gaps_cache
 		
+		# Widget-based gaps - build children with gap widgets
+		gap_builder = gap_info['builder']
+		
 		# Ensure we have enough cached gap widgets
-		self._gap_widget_cache.extend(gap_builder()
-				for _ in range(len(self.children) - len(self._gap_widget_cache) - 1))
+		gap_count = len(self.children) - 1
+		while len(self._gap_widget_cache) < gap_count:
+			self._gap_widget_cache.append(gap_builder())
 
 		# Build children with gaps using cached widgets
 		children_it = iter(self.children)
 		children_with_gaps = [next(children_it)]
-		for gap_widget, child in zip(self._gap_widget_cache, children_it):
+		for gap_widget, child in zip(self._gap_widget_cache[:gap_count], children_it):
 			children_with_gaps.append(gap_widget)
 			children_with_gaps.append(child)
 
@@ -641,11 +684,15 @@ class LayoutContainer(LayoutGroup):
 		if not children_with_gaps:
 			return 0
 		
+		# Get gap information for accurate size calculation
+		gap_info = self._get_gap_info()
+		
 		if self.axis == LayoutGroup.HORIZONTAL:
-			# Horizontal: sum widths
-			return sum(child.query_width_request() for child in children_with_gaps)
+			# Horizontal: sum widths + simple gaps
+			child_width = sum(child.query_width_request() for child in children_with_gaps)
+			return child_width + gap_info['total_simple_gap']
 		else:
-			# Vertical: max width
+			# Vertical: max width (gaps don't affect width)
 			return max(child.query_width_request() for child in children_with_gaps)
 	
 	def query_height_request(self):
@@ -653,27 +700,37 @@ class LayoutContainer(LayoutGroup):
 		if not children_with_gaps:
 			return 0
 		
+		# Get gap information for accurate size calculation
+		gap_info = self._get_gap_info()
+		
 		if self.axis == LayoutGroup.HORIZONTAL:
-			# Horizontal: max height
+			# Horizontal: max height (gaps don't affect height)
 			return max(child.query_height_request() for child in children_with_gaps)
 		else:
-			# Vertical: sum heights
-			return sum(child.query_height_request() for child in children_with_gaps)
+			# Vertical: sum heights + simple gaps
+			child_height = sum(child.query_height_request() for child in children_with_gaps)
+			return child_height + gap_info['total_simple_gap']
 	
 	def distribute_width(self, available_width: int) -> int:
 		children_with_gaps = self._get_children_with_gaps()
 		if not children_with_gaps:
-			self._computed_width = 0
+			self._computed_size[0] = 0
 			return 0
 		
 		if self.axis == LayoutGroup.VERTICAL:
 			# Vertical container: all children get the same available width
 			for child in children_with_gaps:
 				child.distribute_width(available_width)
-			self._computed_width = available_width
+			self._computed_size[0] = available_width
 			return available_width
 		
-		# Horizontal container: distribute width among children
+		# Horizontal container: distribute width among children, accounting for simple gaps
+		gap_info = self._get_gap_info()
+		
+		# For simple gaps, reduce available space by total gap space
+		child_available_width = available_width - gap_info['total_simple_gap']
+		child_available_width = max(0, child_available_width)  # Ensure non-negative
+		
 		def get_width_info(child):
 			# Check if widget has preferred width (indicating it can shrink)
 			min_request = child.query_width_request()
@@ -687,47 +744,61 @@ class LayoutContainer(LayoutGroup):
 			return (min_request, getattr(child, 'width', None), preferred_width, can_shrink)
 		
 		# Use generalized distribution algorithm
-		all_widgets = self._distribute_space_general(children_with_gaps, available_width, get_width_info)
+		all_widgets = self._distribute_space_general(children_with_gaps, child_available_width, get_width_info)
 		
-		# Apply the allocated widths and return total
-		total_allocated = 0
+		# Apply the allocated widths
 		for info in all_widgets:
-			allocated = info['child'].distribute_width(info['allocated'])
-			total_allocated += allocated
+			info['child'].distribute_width(info['allocated'])
 		
-		self._computed_width = total_allocated
-		return total_allocated
+		# Calculate actual width needed: sum of allocated child widths + gaps
+		total_child_width = sum(info['allocated'] for info in all_widgets)
+		actual_width_needed = total_child_width + gap_info['total_simple_gap']
+		
+		# Container claims the maximum of available width and actual width needed
+		container_width = max(available_width, actual_width_needed)
+		self._computed_size[0] = container_width
+		return container_width
 	
 	def distribute_height(self, available_height: int) -> int:
 		children_with_gaps = self._get_children_with_gaps()
 		if not children_with_gaps:
-			self._computed_height = 0
+			self._computed_size[1] = 0
 			return 0
 		
 		if self.axis == LayoutGroup.HORIZONTAL:
 			# Horizontal container: all children get the same available height
 			for child in children_with_gaps:
 				child.distribute_height(available_height)
-			self._computed_height = available_height
+			self._computed_size[1] = available_height
 			return available_height
 		
-		# Vertical container: distribute height among children
+		# Vertical container: distribute height among children, accounting for simple gaps
+		gap_info = self._get_gap_info()
+		
+		# For simple gaps, reduce available space by total gap space
+		child_available_height = available_height - gap_info['total_simple_gap']
+		child_available_height = max(0, child_available_height)  # Ensure non-negative
+		
 		def get_height_info(child):
 			# Height distribution doesn't typically involve shrinking
 			min_request = child.query_height_request()
 			return (min_request, getattr(child, 'height', None), min_request, False)
 		
 		# Use generalized distribution algorithm
-		all_widgets = self._distribute_space_general(children_with_gaps, available_height, get_height_info)
+		all_widgets = self._distribute_space_general(children_with_gaps, child_available_height, get_height_info)
 		
-		# Apply the allocated heights and return total
-		total_allocated = 0
+		# Apply the allocated heights
 		for info in all_widgets:
-			allocated = info['child'].distribute_height(info['allocated'])
-			total_allocated += allocated
+			info['child'].distribute_height(info['allocated'])
 		
-		self._computed_height = total_allocated
-		return total_allocated
+		# Calculate actual height needed: sum of allocated child heights + gaps
+		total_child_height = sum(info['allocated'] for info in all_widgets)
+		actual_height_needed = total_child_height + gap_info['total_simple_gap']
+		
+		# Container claims the maximum of available height and actual height needed
+		container_height = max(available_height, actual_height_needed)
+		self._computed_size[1] = container_height
+		return container_height
 	
 	def _distribute_space_general(self, children, available_space, get_child_info):
 		"""Generalized space distribution algorithm that works for both width and height.
@@ -994,91 +1065,116 @@ class LayoutContainer(LayoutGroup):
 		if not children_with_gaps:
 			return
 		
-		# Position children based on axis and alignment
-		if self.axis == LayoutGroup.HORIZONTAL:
-			self._position_children_horizontal(x, y, children_with_gaps)
-		else:  # LayoutGroup.VERTICAL
-			self._position_children_vertical(x, y, children_with_gaps)
+		# Position children using unified axis-based method
+		self._position_children_unified(x, y, children_with_gaps, self.axis)
 	
-	def _position_children_horizontal(self, container_x: int, container_y: int, children) -> None:
-		"""Position children horizontally within the container.
+	def _position_children_unified(self, container_x: int, container_y: int, children, axis: int) -> None:
+		"""Unified positioning method that works for both horizontal and vertical containers.
 		
-		For horizontal containers:
-		- align[0] controls horizontal (primary axis) alignment
-		- align[1] controls vertical (cross axis) alignment
+		Args:
+			container_x: X coordinate of container
+			container_y: Y coordinate of container  
+			children: List of child widgets to position (may include gap widgets or just actual children)
+			axis: 0 for horizontal (primary axis = width), 1 for vertical (primary axis = height)
 		"""
-		# Calculate total width used by all children (from their computed sizes)
-		total_width = sum(child.get_computed_width() or 0 for child in children)
-		container_width = self.get_computed_width() or 0
-		container_height = self.get_computed_height() or 0
+		# Get container size and gap information
+		container_size = self.get_computed_size()
+		container_pos = [container_x, container_y]
+		gap_info = self._get_gap_info()
 		
-		# Calculate starting x position based on horizontal (primary axis) alignment
-		if total_width < container_width:
-			# There's extra space - use primary axis alignment
-			extra_space = container_width - total_width
-			start_x = container_x + int(extra_space * self.align[0])  # align[0] is primary (horizontal) alignment
-		else:
-			# No extra space - start at container left
-			start_x = container_x
+		# Handle None values by defaulting to 0
+		container_axis_size = container_size[axis] or 0
+		container_cross_size = container_size[1-axis] or 0
 		
-		# Position each child
-		current_x = start_x
-		for child in children:
-			child_width = child.get_computed_width() or 0
-			child_height = child.get_computed_height() or 0
+		if gap_info['type'] == 'simple':
+			# Optimized positioning for simple numeric gaps
+			actual_children = self.children
+			gap_size = gap_info['size']
 			
-			# Calculate y position based on vertical (cross axis) alignment
-			if child_height < container_height:
-				# There's extra space vertically - use cross axis alignment
-				extra_height = container_height - child_height
-				child_y = container_y + int(extra_height * self.align[1])  # align[1] is cross (vertical) alignment
+			# Calculate total space used along primary axis (children only, gaps added separately)
+			total_child_size = sum(child.get_computed_size(axis) or 0 for child in actual_children)
+			total_gap_size = gap_info['total_simple_gap']
+			total_axis_size = total_child_size + total_gap_size
+			
+			# Calculate starting position based on primary axis alignment  
+			if total_axis_size < container_axis_size:
+				# There's extra space - use primary axis alignment
+				extra_space = container_axis_size - total_axis_size
+				start_axis = container_pos[axis] + int(extra_space * self.align[0])  # align[0] is primary axis
 			else:
-				# No extra space - align to container top
-				child_y = container_y
+				# No extra space - start at container edge
+				start_axis = container_pos[axis]
 			
-			# Position the child
-			child.position_at(current_x, child_y)
-			current_x += child_width
-	
-	def _position_children_vertical(self, container_x: int, container_y: int, children) -> None:
-		"""Position children vertically within the container.
-		
-		For vertical containers:
-		- align[0] controls vertical (primary axis) alignment
-		- align[1] controls horizontal (cross axis) alignment
-		"""
-		# Calculate total height used by all children (from their computed sizes)
-		total_height = sum(child.get_computed_height() or 0 for child in children)
-		container_width = self.get_computed_width() or 0
-		container_height = self.get_computed_height() or 0
-		
-		# Calculate starting y position based on vertical (primary axis) alignment
-		if total_height < container_height:
-			# There's extra space - use primary axis alignment
-			extra_space = container_height - total_height
-			start_y = container_y + int(extra_space * self.align[0])  # align[0] is primary (vertical) alignment
-		else:
-			# No extra space - start at container top
-			start_y = container_y
-		
-		# Position each child
-		current_y = start_y
-		for child in children:
-			child_width = child.get_computed_width() or 0
-			child_height = child.get_computed_height() or 0
+			# Position each child with gaps
+			current_axis = start_axis
+			cross_axis = 1 - axis  # Cross axis is the other dimension
 			
-			# Calculate x position based on horizontal (cross axis) alignment
-			if child_width < container_width:
-				# There's extra space horizontally - use cross axis alignment
-				extra_width = container_width - child_width
-				child_x = container_x + int(extra_width * self.align[1])  # align[1] is cross (horizontal) alignment
+			for i, child in enumerate(actual_children):
+				child_size = child.get_computed_size()
+				child_axis_size = child_size[axis] or 0
+				child_cross_size = child_size[cross_axis] or 0
+				
+				# Calculate cross-axis position based on cross-axis alignment
+				if child_cross_size < container_cross_size:
+					# There's extra space on cross axis - use cross axis alignment
+					extra_cross = container_cross_size - child_cross_size
+					child_cross = container_pos[cross_axis] + int(extra_cross * self.align[1])  # align[1] is cross axis
+				else:
+					# No extra space - align to container edge
+					child_cross = container_pos[cross_axis]
+				
+				# Build position tuple in correct order [x, y]
+				pos = [0, 0]
+				pos[axis] = current_axis
+				pos[cross_axis] = child_cross
+				
+				# Position the child
+				child.position_at(pos[0], pos[1])
+				
+				# Advance position by child size + gap (except for last child)
+				current_axis += child_axis_size
+				if i < len(actual_children) - 1:  # Not the last child
+					current_axis += gap_size
+		elif gap_info['type'] == 'widget':
+			# Positioning for widget-based gaps
+			# Calculate total space used along primary axis
+			total_axis_size = sum(child.get_computed_size(axis) or 0 for child in children)
+			
+			# Calculate starting position based on primary axis alignment  
+			if total_axis_size < container_axis_size:
+				# There's extra space - use primary axis alignment
+				extra_space = container_axis_size - total_axis_size
+				start_axis = container_pos[axis] + int(extra_space * self.align[0])  # align[0] is primary axis
 			else:
-				# No extra space - align to container left
-				child_x = container_x
+				# No extra space - start at container edge
+				start_axis = container_pos[axis]
 			
-			# Position the child
-			child.position_at(child_x, current_y)
-			current_y += child_height
+			# Position each child
+			current_axis = start_axis
+			cross_axis = 1 - axis  # Cross axis is the other dimension
+			
+			for child in children:
+				child_size = child.get_computed_size()
+				child_axis_size = child_size[axis] or 0
+				child_cross_size = child_size[cross_axis] or 0
+				
+				# Calculate cross-axis position based on cross-axis alignment
+				if child_cross_size < container_cross_size:
+					# There's extra space on cross axis - use cross axis alignment
+					extra_cross = container_cross_size - child_cross_size
+					child_cross = container_pos[cross_axis] + int(extra_cross * self.align[1])  # align[1] is cross axis
+				else:
+					# No extra space - align to container edge
+					child_cross = container_pos[cross_axis]
+				
+				# Build position tuple in correct order [x, y]
+				pos = [0, 0]
+				pos[axis] = current_axis
+				pos[cross_axis] = child_cross
+				
+				# Position the child
+				child.position_at(pos[0], pos[1])
+				current_axis += child_axis_size
 
 # --- leaf node layouts
 
@@ -1105,7 +1201,7 @@ class LayoutSpacer(LayoutWidget):
 		# Spacers with Expand/Grow dimensions could grow, but for gaps we usually want them fixed
 		# For now, keep gap spacers at their minimum size
 		width = self.width.minim
-		self._computed_width = width
+		self._computed_size[0] = width
 		return width
 	
 	def distribute_height(self, available_height: int) -> int:
@@ -1113,7 +1209,7 @@ class LayoutSpacer(LayoutWidget):
 		# Spacers with Expand/Grow dimensions could grow, but for gaps we usually want them fixed
 		# For now, keep gap spacers at their minimum size
 		height = self.height.minim
-		self._computed_height = height
+		self._computed_size[1] = height
 		return height
 
 class LayoutText(LayoutWidget):
@@ -1244,7 +1340,7 @@ class LayoutText(LayoutWidget):
 		# Clamp to minimum width
 		min_width = self.query_width_request()
 		width = max(available_width, min_width)
-		self._computed_width = width
+		self._computed_size[0] = width
 		return width
 
 class LayoutButton(LayoutWidget):
@@ -1290,13 +1386,13 @@ class LayoutButton(LayoutWidget):
 		# If no explicit width dimension, behave like Fixed (return query width)
 		if self.width is None:
 			width = self.query_width_request()
-			self._computed_width = width
+			self._computed_size[0] = width
 			return width
 		
 		# Handle different dimension types
 		if isinstance(self.width, Fixed):
 			width = self.width.minim
-			self._computed_width = width
+			self._computed_size[0] = width
 			return width
 		elif isinstance(self.width, (Expand, Grow)):
 			# For Expand/Grow, use the available width (clamped to minimum and maximum)
@@ -1306,25 +1402,25 @@ class LayoutButton(LayoutWidget):
 			result = max(available_width, min_width)
 			if max_width is not None:
 				result = min(result, max_width)
-			self._computed_width = result
+			self._computed_size[0] = result
 			return result
 		else:
 			# Fallback for unknown dimension types
 			width = self.query_width_request()
-			self._computed_width = width
+			self._computed_size[0] = width
 			return width
 	
 	def distribute_height(self, available_height: int) -> int:
 		# If no explicit height dimension, behave like Fixed (return query height)
 		if self.height is None:
 			height = self.query_height_request()
-			self._computed_height = height
+			self._computed_size[1] = height
 			return height
 		
 		# Handle different dimension types
 		if isinstance(self.height, Fixed):
 			height = self.height.minim
-			self._computed_height = height
+			self._computed_size[1] = height
 			return height
 		elif isinstance(self.height, (Expand, Grow)):
 			# For Expand/Grow, use the available height (clamped to minimum and maximum)
@@ -1334,12 +1430,12 @@ class LayoutButton(LayoutWidget):
 			result = max(available_height, min_height)
 			if max_height is not None:
 				result = min(result, max_height)
-			self._computed_height = result
+			self._computed_size[1] = result
 			return result
 		else:
 			# Fallback for unknown dimension types
 			height = self.query_height_request()
-			self._computed_height = height
+			self._computed_size[1] = height
 			return height
 	
 	def get_preferred_width(self):

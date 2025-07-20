@@ -328,20 +328,38 @@ class TestLayoutContainers(unittest.TestCase):
 		child1 = LayoutSpacer(width=50, height=30)
 		child2 = LayoutSpacer(width=60, height=40)
 		
+		# Test with simple numeric gap (should return just children)
 		container = LayoutContainer.horizontal(gap=5, children=(child1, child2))
 		
 		# First call should populate cache
 		children_with_gaps_1 = container._get_children_with_gaps()
-		self.assertEqual(len(children_with_gaps_1), 3)  # child1, gap, child2
+		self.assertEqual(len(children_with_gaps_1), 2)  # child1, child2 (simple gaps don't create widgets)
+		self.assertIs(children_with_gaps_1, container.children)  # Should return children directly for simple gaps
 		
 		# Second call should return cached result
 		children_with_gaps_2 = container._get_children_with_gaps()
 		self.assertIs(children_with_gaps_1, children_with_gaps_2)
 		
-		# Cache should be cleared when invalidated
+		# For simple gaps, cache invalidation still returns the same children object
 		container._invalidate_gap_cache()
 		children_with_gaps_3 = container._get_children_with_gaps()
-		self.assertIsNot(children_with_gaps_1, children_with_gaps_3)
+		self.assertIs(children_with_gaps_1, children_with_gaps_3)  # Still same children object for simple gaps
+		
+		# Test with widget-based gap (should create gap widgets)
+		container_widget_gap = LayoutContainer.horizontal(gap=lambda: LayoutSpacer(width=5, height=0), children=(child1, child2))
+		
+		# First call should populate cache with gap widgets
+		children_with_gaps_widget_1 = container_widget_gap._get_children_with_gaps()
+		self.assertEqual(len(children_with_gaps_widget_1), 3)  # child1, gap widget, child2
+		
+		# Second call should return same cached result
+		children_with_gaps_widget_2 = container_widget_gap._get_children_with_gaps()
+		self.assertIs(children_with_gaps_widget_1, children_with_gaps_widget_2)
+		
+		# Cache invalidation should create new gap widgets
+		container_widget_gap._invalidate_gap_cache()
+		children_with_gaps_widget_3 = container_widget_gap._get_children_with_gaps()
+		self.assertIsNot(children_with_gaps_widget_1, children_with_gaps_widget_3)  # Different objects after invalidation
 
 
 class TestComplexLayouts(unittest.TestCase):
