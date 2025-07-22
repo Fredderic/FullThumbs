@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """ NOTES and TODOs:
 - WM_SIZE message handler (to handle window resizing)
 - WM_GETMINMAXINFO message handler
@@ -21,6 +23,18 @@ POSITIONING SYSTEM: ✅ COMPLETE
 	✅ Padding offsets and spacing
 	✅ Complete layout method (size + position)
 
+Nice to haves:
+- Stretch alignment options: "Space around" and "Space between" layout
+	- Space between is just using Grow spacers between the widgets
+		- This is already implemented in the layout system
+		- Though doing it again could still be useful
+	- Space Around is the same, but with an extra spacer at the start and end
+		- This is not directly supported by the current system
+		- You would need to add all the spacers yourself, and specify no gaps
+	- But, we should be able to do better using the system for numeric gaps
+		- Stretch over widget gaps should still work just fine, but...
+		- Only widget gaps (and none) should be supported under stretch alignment
+
 + Fit sizing widths
 + Grow and shrink widths
 + Wrap text
@@ -30,114 +44,14 @@ POSITIONING SYSTEM: ✅ COMPLETE
 - Draw widgets
 """
 
+from typing import Optional, Union, Type
+
 # -------
 # Text Measurement Interface
 # -------
 
-def _default_measure_text_width(text, font=None):
-	"""Default text width measurement implementation.
-	
-	This is a placeholder implementation that provides rough estimates
-	based on character classification. In production, this should be
-	replaced with actual font measurement using system APIs.
-	
-	Args:
-		text: The complete text string to measure
-		font: Font information (currently unused)
-		
-	Returns:
-		int: Estimated text width in pixels
-	"""
-	if not text:
-		return 0
-	
-	# TODO: Replace with actual text measurement APIs like:
-	# Windows: GetTextExtentPoint32(hdc, text, len(text), &size)
-	# Cross-platform: FreeType, Skia, Pango, etc.
-	
-	# For now, use character classification for better estimates
-	# These are very rough approximations - real measurement is essential
-	width = 0
-	for char in text:
-		if char == ' ':
-			width += 4  # Spaces are narrow
-		elif char in 'ij':
-			width += 4  # Very narrow characters
-		elif char in 'Il1':
-			width += 5  # Narrow characters
-		elif char in 'frt':
-			width += 6  # Somewhat narrow
-		elif char in 'abcdeghknopqsuvxyz':
-			width += 8  # Average width
-		elif char in 'ABCDEFGHIJKLMNOPQRSTUVXYZ':
-			width += 10  # Capital letters are wider
-		elif char in 'mw':
-			width += 12  # Wide lowercase
-		elif char in 'MW':
-			width += 14  # Wide capitals
-		elif ord(char) > 127:
-			# Non-ASCII characters - could be anything!
-			# CJK characters are typically much wider
-			if ord(char) >= 0x4E00 and ord(char) <= 0x9FFF:  # CJK range
-				width += 16  # CJK characters are typically wider
-			elif ord(char) >= 0x0100:  # Extended Latin and beyond
-				width += 10  # Assume similar to capitals
-			else:
-				width += 8  # Default assumption
-		else:
-			width += 8  # Punctuation and other characters
-	
-	return width
-
-def _default_get_font_metrics(font=None):
-	"""Default font metrics implementation.
-	
-	This is a placeholder that will eventually interface with the system's
-	font measurement APIs to get accurate font information.
-	
-	Args:
-		font: Font information (currently unused)
-		
-	Returns:
-		dict: Font metrics with keys 'height'
-	"""
-	# TODO: Replace with actual font measurement using system APIs
-	# For Windows, this would use GDI functions like GetTextMetrics
-	# For cross-platform, could use libraries like FreeType
-	
-	font_height = 16  # Default UI font height
-	
-	return {
-		'height': font_height,
-	}
-
-# Global text measurement function - can be replaced by applications
-measure_text_width = _default_measure_text_width
-get_font_metrics = _default_get_font_metrics
-
-def set_text_measurement_functions(width_func=None, metrics_func=None):
-	"""Set custom text measurement functions.
-	
-	This allows applications to replace the default estimation functions
-	with actual font measurement implementations using system APIs.
-	
-	Args:
-		width_func: Function(text, font) -> int that measures text width,
-		           or None to restore the default function
-		metrics_func: Function(font) -> dict that returns font metrics,
-		            or None to restore the default function
-	"""
-	global measure_text_width, get_font_metrics
-	
-	if width_func is not None:
-		measure_text_width = width_func
-	else:
-		measure_text_width = _default_measure_text_width
-	
-	if metrics_func is not None:
-		get_font_metrics = metrics_func
-	else:
-		get_font_metrics = _default_get_font_metrics
+# Global layout context for plugin system - will be initialized with decorator
+_layout_context: Optional[LayoutPluginContext] = None
 
 # -------
 # Layout Classes
@@ -161,7 +75,7 @@ class Dimension(tuple):
 		if cls is Dimension:
 			# Called on base class - check if we should auto-wrap in Fixed
 			if len(args) == 1 and len(kwargs) == 0:
-				if isinstance(args[0], (int, float)):
+				if isinstance(args[0], (int, float, bool)):
 					return Fixed(args[0])
 				elif isinstance(args[0], Dimension):
 					# Already a Dimension instance, return it unchanged
@@ -190,7 +104,10 @@ class Fixed(Dimension):
 	__slots__ = ()
 	
 	def __new__(cls, value):
-		assert isinstance(value, (int, float)), f"Fixed value must be a number, got {type(value).__name__}: {value}"
+		if isinstance(value, bool):
+			value = int(value)
+		assert isinstance(value, (int, float, bool)), \
+			f"Fixed value must be a number, got {type(value).__name__}: {value}"
 		return tuple.__new__(cls, (value,))
 
 	@property
@@ -406,18 +323,18 @@ class Layout:
 		Args:
 			value: The value to expand (can be single value, tuple, or list)
 			default_second: If provided, use this as the second value when expanding
-			               single values instead of repeating the first value
+						   single values instead of repeating the first value
 		
 		Returns:
 			tuple: Two-element tuple
 		"""
 		if not isinstance(value, (list, tuple)):
 			# Single value - use default_second if provided, otherwise repeat the value
-			second_value = default_second if default_second is not None else value
+			second_value = value if default_second is None else default_second
 			return (value, second_value)
 		elif len(value) == 1:
 			# Single element in sequence - same logic as above
-			second_value = default_second if default_second is not None else value[0]
+			second_value = value[0] if default_second is None else default_second
 			return (value[0], second_value)
 		elif len(value) == 2:
 			return tuple(value)
@@ -438,45 +355,164 @@ class Layout:
 
 # --- single-child layouts
 
+
 class LayoutSingle(Layout):
 	def __init__(self, child=None):
 		super().__init__()
 		self.child = child
 
 	def query_width_request(self):
-		# Query the width requirements of the child layout
 		if self.child:
 			return self.child.query_width_request()
 		return super().query_width_request()
-	
+
 	def query_height_request(self):
-		# Query the height requirements of the child layout
 		if self.child:
 			return self.child.query_height_request()
 		return super().query_height_request()
-	
+
 	def distribute_width(self, available_width: int) -> int:
-		# Pass through width distribution to child
 		if self.child:
 			width = self.child.distribute_width(available_width)
 			self._computed_size[0] = width
 			return width
 		return super().distribute_width(available_width)
-	
+
 	def distribute_height(self, available_height: int) -> int:
-		# Pass through height distribution to child
 		if self.child:
 			height = self.child.distribute_height(available_height)
 			self._computed_size[1] = height
 			return height
 		return super().distribute_height(available_height)
-	
+
 	def position_at(self, x: int, y: int) -> None:
-		"""Position this layout and its child at the specified coordinates."""
 		super().position_at(x, y)
-		# Pass through positioning to child (same position)
 		if self.child:
 			self.child.position_at(x, y)
+
+# --- LayoutSized widget ---
+class LayoutSized(LayoutSingle):
+	"""
+	LayoutSized wraps a single child and applies unified sizing and alignment.
+	It uses a sizing property (Fixed, Expand, Grow) to claim space from its parent,
+	and then positions/sizes its child within that space, prioritizing the child's explicit size.
+	The sizing engine can be reused by LayoutContainer by passing aggregate requests and None for explicit size.
+	"""
+	def __init__(self, child=None, sizing=None, align=Layout.CENTER):
+		super().__init__(child)
+		self.sizing = Dimension(sizing) if sizing is not None else None
+		self.align = align
+
+	def query_width_request(self):
+		# Use child's query and explicit width if available
+		child_request = self.child.query_width_request() if self.child else 0
+		explicit = getattr(self.child, 'width', None)
+		return self._compute_axis_request(child_request, explicit)
+
+	def query_height_request(self):
+		child_request = self.child.query_height_request() if self.child else 0
+		explicit = getattr(self.child, 'height', None)
+		return self._compute_axis_request(child_request, explicit)
+
+	def distribute_width(self, available_width: int) -> int:
+		# Compute the wrapper's claimed width
+		child_request = self.child.query_width_request() if self.child else 0
+		explicit = getattr(self.child, 'width', None)
+		claimed = self._compute_axis_size(child_request, explicit, available_width)
+		self._computed_size[0] = claimed
+		# Now size/position child within claimed space
+		if self.child:
+			child_width = explicit.minim if explicit is not None else child_request
+			# Clamp child width to claimed space
+			child_width = min(child_width, claimed)
+			self.child.distribute_width(child_width)
+		return claimed
+
+	def distribute_height(self, available_height: int) -> int:
+		child_request = self.child.query_height_request() if self.child else 0
+		explicit = getattr(self.child, 'height', None)
+		claimed = self._compute_axis_size(child_request, explicit, available_height)
+		self._computed_size[1] = claimed
+		if self.child:
+			child_height = explicit.minim if explicit is not None else child_request
+			child_height = min(child_height, claimed)
+			self.child.distribute_height(child_height)
+		return claimed
+
+	def position_at(self, x: int, y: int) -> None:
+		super().position_at(x, y)
+		# Align child within claimed space
+		if self.child:
+			child_size = self.child.get_computed_size()
+			wrapper_size = self.get_computed_size()
+			offset_x = x + int((wrapper_size[0] - (child_size[0] or 0)) * self._get_align_value(0))
+			offset_y = y + int((wrapper_size[1] - (child_size[1] or 0)) * self._get_align_value(1))
+			self.child.position_at(offset_x, offset_y)
+
+	def _compute_axis_request(self, requested, explicit):
+		# If explicit dimension, use its minimum
+		if explicit is not None:
+			return explicit.minim
+		# If sizing property, use its minimum
+		if self.sizing is not None:
+			return self.sizing.minim
+		# Otherwise, use requested
+		return requested
+
+	def _compute_axis_size(self, requested, explicit, available):
+		# If explicit dimension, branch by type
+		if explicit is not None:
+			size = max(explicit.minim, requested)
+			if explicit.maxim is not None:
+				size = min(size, explicit.maxim)
+			return min(size, available)
+
+		# If sizing property, branch by type
+		if self.sizing is not None:
+			if isinstance(self.sizing, Fixed):
+				size = self.sizing.minim
+			elif isinstance(self.sizing, Expand):
+				# Proportional minimum
+				if isinstance(self.sizing.minim, (int, float)) and 0 <= self.sizing.minim <= 1:
+					min_size = int(self.sizing.minim * available)
+				else:
+					raise ValueError(f"Sizing minimum ({self.sizing.minim}) must be between 0 and 1.")
+				size = max(min_size, requested)
+				# Proportional maximum
+				if self.sizing.maxim is not None:
+					if isinstance(self.sizing.maxim, (int, float)) and 0 < self.sizing.maxim <= 1:
+						max_size = int(self.sizing.maxim * available)
+					else:
+						raise ValueError(f"Sizing maximum ({self.sizing.maxim}) must be between 0 and 1.")
+					size = min(size, max_size)
+			elif isinstance(self.sizing, Grow):
+				# Use a proportion of the remaining available space
+				remaining = max(available - requested, 0)
+				# Proportional minimum
+				if isinstance(self.sizing.minim, (int, float)) and 0 <= self.sizing.minim <= 1:
+					min_size = int(self.sizing.minim * remaining)
+				else:
+					raise ValueError(f"Sizing minimum ({self.sizing.minim}) must be between 0 and 1.")
+				size = requested + min_size
+				# Proportional maximum
+				if self.sizing.maxim is not None:
+					if isinstance(self.sizing.maxim, (int, float)) and 0 < self.sizing.maxim <= 1:
+						max_size = requested + int(self.sizing.maxim * remaining)
+					else:
+						raise ValueError(f"Sizing maximum ({self.sizing.maxim}) must be between 0 and 1.")
+					size = min(size, max_size)
+			else:
+				size = max(self.sizing.minim, requested)
+			return min(size, available)
+
+		# Otherwise, clamp requested to available
+		return min(requested, available)
+
+	def _get_align_value(self, axis):
+		# Support tuple or single value for alignment
+		if isinstance(self.align, (tuple, list)):
+			return self.align[axis] if axis < len(self.align) else Layout.CENTER
+		return self.align
 
 class LayoutWindow(LayoutSingle):
 	pass
@@ -832,9 +868,7 @@ class LayoutContainer(LayoutGroup):
 				'child': child,
 				'dimension': actual_dimension,
 				'min_space': min_request,
-				'preferred_space': preferred_size,
 				'allocated': preferred_size,  # Start with preferred size
-				'can_shrink': can_shrink,
 				'is_grow': isinstance(actual_dimension, Grow)  # Track if this is a Grow widget for sorting
 			}
 			
@@ -1223,8 +1257,8 @@ class LayoutText(LayoutWidget):
 	def get_extents(text, font=None):
 		"""Estimate the extents (width, height) of text.
 		
-		This is a convenience method that uses the global text measurement
-		functions to calculate text dimensions.
+		This is a convenience method that uses the plugin system
+		to calculate text dimensions.
 		
 		Args:
 			text: The text string to measure
@@ -1236,17 +1270,18 @@ class LayoutText(LayoutWidget):
 		if not text:
 			return (0, 0)
 		
-		metrics = get_font_metrics(font)
+		assert _layout_context is not None, "Layout context not initialized"
+		metrics = _layout_context.get_font_metrics(font)
 		font_height = metrics['height']
 		
 		# For multiline text, calculate based on lines
 		lines = text.split('\n')
 		if len(lines) > 1:
-			max_line_width = max(measure_text_width(line, font) for line in lines)
+			max_line_width = max(_layout_context.measure_text_width(line, font) for line in lines)
 			width = max_line_width
 			height = len(lines) * font_height
 		else:
-			width = measure_text_width(text, font)
+			width = _layout_context.measure_text_width(text, font)
 			height = font_height
 		
 		return (width, height)
@@ -1259,7 +1294,8 @@ class LayoutText(LayoutWidget):
 		# Minimum width should be based on actual content, but allow for some shrinking
 		# Use a small representative text sample to determine reasonable minimum
 		sample_chars = "Wj"  # Wide and narrow character combination
-		min_char_width = measure_text_width(sample_chars, self.font) // 2
+		assert _layout_context is not None, "Layout context not initialized"
+		min_char_width = _layout_context.measure_text_width(sample_chars, self.font) // 2
 		return max(min_char_width * 2, 16)  # At least space for a couple characters
 	
 	def query_height_request(self):
@@ -1292,7 +1328,9 @@ class LayoutText(LayoutWidget):
 			return 0
 		
 		# Find the longest word - this sets our absolute minimum
-		longest_word_width = max(measure_text_width(word, self.font) for word in words)
+		assert _layout_context is not None, "Layout context not initialized"
+		longest_word_width = max(_layout_context.measure_text_width(word, self.font) for word in words)
+		
 		min_width = self.query_width_request()
 		actual_min = max(min_width, longest_word_width)
 		
@@ -1307,7 +1345,8 @@ class LayoutText(LayoutWidget):
 			# Try adding this word to the current line
 			test_line_words = current_line_words + [word]
 			test_line_text = ' '.join(test_line_words)
-			test_line_width = measure_text_width(test_line_text, self.font)
+			
+			test_line_width = _layout_context.measure_text_width(test_line_text, self.font)
 			
 			if test_line_width <= target_width:
 				# Word fits on current line
@@ -1327,7 +1366,7 @@ class LayoutText(LayoutWidget):
 		
 		# Find the actual width needed (measure the widest line)
 		if lines:
-			actual_width = max(measure_text_width(line, self.font) for line in lines)
+			actual_width = max(_layout_context.measure_text_width(line, self.font) for line in lines)
 			return max(actual_width, actual_min)
 		else:
 			return actual_min
@@ -1357,8 +1396,11 @@ class LayoutButton(LayoutWidget):
 	
 	def set_text(self, text):
 		"""Update the button text and refresh the internal layout calculations."""
-		# Create a new LayoutText for text measurement calculations
-		self._text_layout = LayoutText(text)
+		# Use the global layout context to create the appropriate text widget
+		if _layout_context is not None:
+			self._text_layout = _layout_context.create_text(text)
+		else:
+			self._text_layout = LayoutText(text)
 	
 	def get_text(self):
 		"""Get the current button text from the internal layout."""
@@ -1486,8 +1528,11 @@ class LayoutEdit(LayoutWidget):
 	
 	def set_text(self, text):
 		"""Update the edit control text and refresh the internal layout calculations."""
-		# Create a new LayoutText for text measurement calculations
-		self._text_layout = LayoutText(text)
+		# Use the global layout context to create the appropriate text widget
+		if _layout_context is not None:
+			self._text_layout = _layout_context.create_text(text)
+		else:
+			self._text_layout = LayoutText(text)
 	
 	def get_text(self):
 		"""Get the current edit control text from the internal layout."""
@@ -1537,18 +1582,22 @@ class LayoutEdit(LayoutWidget):
 		return None
 
 class LayoutLink(LayoutText):
-	def __init__(self, text, url, font=None, color=None):
-		self.text = text
+	def __init__(self, url, title=None, font=None, color=None):
+		super().__init__(title or url, font, color)
 		self.url = url
-		self.font = font
-		self.color = color
 
 class LayoutHorizontalLine(LayoutWidget):
 	def query_width_request(self):
 		return 0  # No horizontal space request
 	
 	def query_height_request(self):
-		return 1  # 1px tall
+		height = 1  # 1px tall
+		return height
+	
+	def distribute_width(self, available_width: int) -> int:
+		# Horizontal line doesn't take any width, just fills the available space
+		self._computed_size[0] = available_width
+		return available_width
 
 # -------
 
@@ -1567,7 +1616,7 @@ def build_about_dialog(about_text, github_link):
 						gap=5,  # 5px gap between text and link
 						children=(
 							LayoutEdit(about_text, multiline=True, read_only=True, width=380, height=150),
-							LayoutLink("Visit GitHub Repository", github_link, font="Arial", color="blue")
+							LayoutLink(github_link, "Visit GitHub Repository", font="Arial", color="blue")
 						)
 					),
 				),
@@ -1644,290 +1693,103 @@ def build_test_vertical_layout():
 	)
 
 # -------
+# Plugin System
+# -------
+
+def set_layout_context(context: LayoutPluginContext):
+	"""Set the global layout context."""
+	global _layout_context
+	_layout_context = context
+
+def layout_context(context_class):
+	"""Decorator to set a layout context class as the global context."""
+	set_layout_context(context_class())
+	return context_class
+
+@layout_context
+class LayoutPluginContext:
+	"""Simple context for widget creation and text measurement."""
+	
+	def create_text(self, text, font=None, color=None):
+		"""Create a text widget. Override in subclasses for platform-specific widgets."""
+		return LayoutText(text, font, color)
+	
+	def measure_text_width(self, text, font=None):
+		"""Measure text width. Override in subclasses for platform-specific measurement."""
+		if not text:
+			return 0
+		
+		# Character classification for better estimates
+		width = 0
+		for char in text:
+			if char == ' ':
+				width += 4  # Spaces are narrow
+			elif char in 'ij':
+				width += 4  # Very narrow characters
+			elif char in 'Il1':
+				width += 5  # Narrow characters
+			elif char in 'frt':
+				width += 6  # Somewhat narrow
+			elif char in 'abcdeghknopqsuvxyz':
+				width += 8  # Average width
+			elif char in 'ABCDEFGHIJKLMNOPQRSTUVXYZ':
+				width += 10  # Capital letters are wider
+			elif char in 'mw':
+				width += 12  # Wide lowercase
+			elif char in 'MW':
+				width += 14  # Wide capitals
+			elif ord(char) > 127:
+				# Non-ASCII characters
+				if ord(char) >= 0x4E00 and ord(char) <= 0x9FFF:  # CJK range
+					width += 16  # CJK characters are typically wider
+				elif ord(char) >= 0x0100:  # Extended Latin and beyond
+					width += 10  # Assume similar to capitals
+				else:
+					width += 8  # Default assumption
+			else:
+				width += 8  # Punctuation and other characters
+		
+		return width
+	
+	def get_font_metrics(self, font=None):
+		"""Get font metrics. Override in subclasses for platform-specific metrics."""
+		font_height = 16  # Default UI font height
+		return {
+			'height': font_height,
+		}
+
+# -------
+# Demo and Testing
+# -------
 
 if __name__ == "__main__":
 	"""Run a simple demonstration when the module is executed directly."""
 	
-	# Simple demonstration of the layout system
 	print("Window Layout Engine Demo")
 	print("=" * 25)
 	
-	# Build a sample dialog
-	about_text = """FullThumbs PiP Viewer
+	# Build a sample dialog to demonstrate the layout system
+	about_text = """Window Layout Engine
 Version: 1.0.0-dev
-A Picture-in-Picture viewer application for Windows."""
+A flexible layout system for Windows applications with intelligent sizing and positioning."""
 	
-	github_link = "https://github.com/Fredderic/FullThumbs"
+	github_link = "https://github.com/Fredderic"
 	layout = build_about_dialog(about_text, github_link)
 	
-	print(f"Full Dialog Layout: {type(layout).__name__}")
-	print(f"Full Dialog Dimensions: {layout.query_space_request()}")
-	print()
+	# Show the layout structure
+	print(f"Dialog Layout: {type(layout).__name__}")
+	print(f"Required Size: {layout.query_width_request()}x{layout.query_height_request()}")
 	
-	# Build test button layout for distribution testing
-	test_layout = build_test_button_layout()
-	print(f"Test Button Layout: {type(test_layout).__name__}")
-	print(f"Test Layout Dimensions: {test_layout.query_space_request()}")
-	print()
-	
-	# Show the button details
-	print("Button layout children:")
-	children_with_gaps = test_layout._get_children_with_gaps()
-	for i, child in enumerate(children_with_gaps):
-		if hasattr(child, 'get_text'):
-			text = child.get_text()
-			width_info = f"width={child.width}" if child.width else "auto-width"
-			print(f"  {i}: {type(child).__name__}('{text}') - {width_info} -> {child.query_space_request()}")
-		else:
-			print(f"  {i}: {type(child).__name__}(spacer) -> {child.query_space_request()}")
+	# Perform layout at 400x300
+	actual_size = layout.layout(0, 0, 400, 300)
+	print(f"Actual Size: {actual_size[0]}x{actual_size[1]}")
+	print(f"Dialog Rect: {layout.get_computed_rect()}")
 	
 	print()
-	
-	# Test distribution with different available widths
-	print("Testing width distribution:")
-	test_widths = [300, 370, 400, 500, 800]  # minimum, some extra, lots extra, way too much
-	
-	for test_width in test_widths:
-		print(f"\nDistributing {test_width}px width:")
-		actual_width = test_layout.distribute_width(test_width)
-		print(f"  Actual distributed width: {actual_width}px")
-		
-		# Test specific widgets with known allocations to better understand distribution
-		print("  Expected behavior:")
-		print(f"    Fixed: always 75px")
-		print(f"    Expand(50, max=120): grows from 50px, capped at 120px")
-		print(f"    Grow Small(30): grows from 30px, no limit")
-		print(f"    Grow Large(100, max=150): grows from 100px, capped at 150px")
-		print(f"    Auto: always 75px (acts like Fixed)")
-		print(f"    Spacers: always 10px each (4 total = 40px)")
-		
-		non_spacer_space = test_width - 40  # Subtract spacer space
-		print(f"    Non-spacer space to distribute: {non_spacer_space}px")
-		
-		fixed_space = 75 + 75  # Fixed + Auto
-		variable_space = non_spacer_space - fixed_space
-		print(f"    Space for variable widgets: {variable_space}px")
-	
-	print()
-	
-	# Test text wrapping with a new layout
-	print("Testing text wrapping:")
-	text_layout = build_test_text_layout()
-	print(f"Text Layout Dimensions: {text_layout.query_space_request()}")
-	
-	# Test with various widths to see how text behaves
-	test_text_widths = [200, 300, 400, 600]  # From constrained to spacious
-	
-	for test_width in test_text_widths:
-		print(f"\nDistributing {test_width}px width for text layout:")
-		actual_width = text_layout.distribute_width(test_width)
-		print(f"  Actual distributed width: {actual_width}px")
-		
-		# Show expected behavior
-		print("  Expected behavior:")
-		print(f"    Fixed button: 75px")
-		print(f"    Text: can shrink from preferred size (wrapping)")
-		print(f"    End button: 50px")
-		print(f"    Spacers: 20px total")
-		print(f"    Available for text: {test_width - 75 - 50 - 20}px")
-	
-	print()
-	
-	# Test height distribution with vertical layout
-	print("Testing height distribution:")
-	vertical_layout = build_test_vertical_layout()
-	print(f"Vertical Layout Dimensions: {vertical_layout.query_space_request()}")
-	
-	test_heights = [125, 150, 200, 300]  # minimum, some extra, lots extra, way too much
-	
-	for test_height in test_heights:
-		print(f"\nDistributing {test_height}px height:")
-		actual_height = vertical_layout.distribute_height(test_height)
-		print(f"  Actual distributed height: {actual_height}px")
-		
-		print("  Expected behavior:")
-		print(f"    Fixed: always 25px")
-		print(f"    Expand(20, max=60): grows from 20px, capped at 60px")
-		print(f"    Grow Small(15): grows from 15px, no limit")
-		print(f"    Grow Large(40, max=80): grows from 40px, capped at 80px")
-		print(f"    Auto: always 25px (acts like Fixed)")
-		print(f"    Spacers: always 5px each (4 total = 20px)")
-		
-		non_spacer_space = test_height - 20  # Subtract spacer space
-		print(f"    Non-spacer space to distribute: {non_spacer_space}px")
-		
-		fixed_space = 25 + 25  # Fixed + Auto
-		variable_space = non_spacer_space - fixed_space
-		print(f"    Space for variable widgets: {variable_space}px")
-	
-	print()
-	
-	# Test positioning functionality
-	print("Testing positioning:")
-	simple_layout = LayoutContainer.horizontal(
-		children=(
-			LayoutButton("Left", id=1, width=75),
-			LayoutButton("Right", id=2, width=50),
-		)
-	)
-	
-	# Perform complete layout at position (100, 200) with size 200x50
-	actual_size = simple_layout.layout(100, 200, 200, 50)
-	print(f"Simple layout actual size: {actual_size}")
-	print(f"Container position: {simple_layout.get_computed_position()}")
-	print(f"Container rect: {simple_layout.get_computed_rect()}")
-	
-	# Check child positions
-	children_with_gaps = simple_layout._get_children_with_gaps()
-	for i, child in enumerate(children_with_gaps):
-		if hasattr(child, 'get_text'):
-			text = child.get_text()
-			rect = child.get_computed_rect()
-			print(f"  Button '{text}': {rect}")
-		else:
-			rect = child.get_computed_rect()
-			print(f"  Spacer: {rect}")
-	
-	print()
-	
-	# Test alignment
-	print("Testing alignment (centered buttons in larger container):")
-	centered_layout = LayoutContainer.horizontal(
-		align=Layout.CENTER,  # Center horizontally and vertically
-		children=(
-			LayoutButton("A", id=1, width=50, height=20),
-			LayoutButton("B", id=2, width=50, height=20),
-		)
-	)
-	
-	# Layout in a larger space than needed
-	actual_size = centered_layout.layout(0, 0, 300, 100)
-	print(f"Centered layout actual size: {actual_size}")
-	print(f"Container rect: {centered_layout.get_computed_rect()}")
-	
-	# Check child positions - should be centered
-	children_with_gaps = centered_layout._get_children_with_gaps()
-	for i, child in enumerate(children_with_gaps):
-		if hasattr(child, 'get_text'):
-			text = child.get_text()
-			rect = child.get_computed_rect()
-			print(f"  Button '{text}': {rect}")
-		else:
-			rect = child.get_computed_rect()
-			print(f"  Spacer: {rect}")
-	
-	expected_total_width = 100  # 50 + 50
-	expected_x_offset = (300 - expected_total_width) // 2  # (300 - 100) / 2 = 100
-	expected_y_offset = (100 - 20) // 2  # (100 - 20) / 2 = 40
-	print(f"  Expected horizontal offset: {expected_x_offset}, vertical offset: {expected_y_offset}")
-	print(f"  Note: Container only uses space it needs (100x100), not full available (300x100)")
-	print(f"        Alignment happens within the container's bounds, not the full available space")
-	
-	print()
-	
-	# Test with padding to create a larger container that does use full space
-	print("Testing alignment with padding (forces container to use full space):")
-	padded_layout = LayoutPadding(
-		padding=50,  # 50px padding on all sides
-		child=LayoutContainer.horizontal(
-			align=Layout.CENTER,
-			children=(
-				LayoutButton("X", id=1, width=40, height=20),
-				LayoutButton("Y", id=2, width=40, height=20),
-			)
-		)
-	)
-	
-	# Layout in available space
-	actual_size = padded_layout.layout(0, 0, 300, 200)
-	print(f"Padded layout actual size: {actual_size}")
-	print(f"Outer container rect: {padded_layout.get_computed_rect()}")
-	print(f"Inner container rect: {padded_layout.child.get_computed_rect()}")
-	
-	# Check child positions
-	inner_children = padded_layout.child._get_children_with_gaps()
-	for i, child in enumerate(inner_children):
-		if hasattr(child, 'get_text'):
-			text = child.get_text()
-			rect = child.get_computed_rect()
-			print(f"  Button '{text}': {rect}")
-	
-	print(f"  Inner container available space: {200}x{100} (200x200 - 100px vertical padding)")
-	print(f"  Buttons total width: 80px, so offset should be (200-80)/2 = 60px from inner left")
-	print(f"  Inner left starts at x=50, so buttons should start at x=110")
-	
-	print()
-	
-	# Test improved alignment functionality
-	print("Testing improved alignment (START/END vs LEFT/RIGHT):")
-	
-	# Test horizontal container with explicit cross-axis alignment
-	horizontal_layout = LayoutContainer.horizontal(
-		align=(Layout.CENTER, Layout.END),  # Center horizontally, align to bottom vertically
-		children=(
-			LayoutButton("A", id=1, width=50, height=20),
-			LayoutButton("B", id=2, width=50, height=30),  # Different height to see cross-axis alignment
-		)
-	)
-	
-	# Layout in a larger space
-	horizontal_layout.layout(0, 0, 200, 80)
-	print(f"Horizontal container with (CENTER, END) alignment:")
-	print(f"  Container rect: {horizontal_layout.get_computed_rect()}")
-	
-	children_with_gaps = horizontal_layout._get_children_with_gaps()
-	for i, child in enumerate(children_with_gaps):
-		if hasattr(child, 'get_text'):
-			text = child.get_text()
-			rect = child.get_computed_rect()
-			print(f"    Button '{text}': {rect}")
-	
-	print(f"  Expected: Buttons centered horizontally within 200px, aligned to bottom within 80px")
-	print()
-	
-	# Test vertical container with cross-axis alignment
-	vertical_layout = LayoutContainer.vertical(
-		align=(Layout.END, Layout.CENTER),  # Align to bottom vertically, center horizontally
-		children=(
-			LayoutButton("X", id=3, width=40, height=25),
-			LayoutButton("Y", id=4, width=60, height=25),  # Different width to see cross-axis alignment
-		)
-	)
-	
-	# Layout in a larger space
-	vertical_layout.layout(0, 0, 150, 100)
-	print(f"Vertical container with (END, CENTER) alignment:")
-	print(f"  Container rect: {vertical_layout.get_computed_rect()}")
-	
-	children_with_gaps = vertical_layout._get_children_with_gaps()
-	for i, child in enumerate(children_with_gaps):
-		if hasattr(child, 'get_text'):
-			text = child.get_text()
-			rect = child.get_computed_rect()
-			print(f"    Button '{text}': {rect}")
-	
-	print(f"  Expected: Buttons aligned to bottom within 100px, centered horizontally within 150px")
-	print()
-	
-	# Test single-axis alignment (should default cross-axis to START)
-	single_align_layout = LayoutContainer.horizontal(
-		align=Layout.END,  # Only specify primary axis - cross axis should default to START
-		children=(
-			LayoutButton("Single", id=5, width=80, height=20),
-		)
-	)
-	
-	single_align_layout.layout(0, 0, 200, 60)
-	print(f"Single alignment (END only) - cross axis should default to START:")
-	print(f"  Container rect: {single_align_layout.get_computed_rect()}")
-	button = single_align_layout._get_children_with_gaps()[0]
-	print(f"  Button rect: {button.get_computed_rect()}")
-	print(f"  Expected: Button aligned to right (END) horizontally, top (START) vertically")
-	
-	print()
-	print("For comprehensive testing, run: python test_window_layout.py")
+	print("For comprehensive testing, run:")
+	print("  python -m unittest test_window_layout -v")
 	print("For selective tests:")
-	print("  Dimensions only: python -m unittest test_window_layout.TestDimensionClasses -v")
-	print("  Widgets only:    python -m unittest test_window_layout.TestLayoutWidgets -v")
-	print("  Containers only: python -m unittest test_window_layout.TestLayoutContainers -v")
-	print("  Complex only:    python -m unittest test_window_layout.TestComplexLayouts -v")
+	print("  python -m unittest test_window_layout.TestDimensionClasses -v")
+	print("  python -m unittest test_window_layout.TestLayoutWidgets -v")
+	print("  python -m unittest test_window_layout.TestLayoutContainers -v")
+	print("  python -m unittest test_window_layout.TestComplexLayouts -v")
