@@ -99,6 +99,7 @@ MENU_ID_WINDOW_MODE_NORMAL = 1004
 MENU_ID_WINDOW_MODE_TOPMOST = 1005
 MENU_ID_WINDOW_MODE_MINIMAL = 1006
 MENU_ID_CHECK_UPDATES = 1007
+MENU_ID_RESTART_THUMBNAIL = 1008
 
 TIMER_CHECK_SOURCE = Timer(id=2001, ms=200)  # Check source window every 200 ms
 TIMER_SAVE_WIN_POS = Timer(id=2002, ms=1000) # Save window position every second
@@ -134,6 +135,8 @@ def present_context_menu(hwnd, screen_x, screen_y):
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_CHECK_UPDATES, "Check for Updates")
 	if DEBUG_PY:
 		win32gui.EnableMenuItem(hmenu, MENU_ID_CHECK_UPDATES, win32con.MF_GRAYED)
+
+	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_RESTART_THUMBNAIL, "Restart Thumbnail")
 	
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_ABOUT, "About...")
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_EXIT, "Exit PiP")
@@ -150,6 +153,8 @@ def present_context_menu(hwnd, screen_x, screen_y):
 	print(f"Context menu command selected: {result}")
 	win32gui.DestroyMenu(hmenu) # Clean up the menu after use
 	return True # Indicate the menu was presented
+
+# -------
 
 def show_about_dialog(parent_hwnd, about_text):
 	"""Show an about dialog with selectable text and clickable GitHub link."""
@@ -489,7 +494,10 @@ def show_about_dialog(parent_hwnd, about_text):
 	except Exception as e:
 		print(f"Error creating about dialog: {e}")
 		# Fallback to simple message box
-		win32gui.MessageBox(parent_hwnd, about_text.replace('\r\n', '\n'), "About FullThumbs", win32con.MB_OK)
+		win32gui.MessageBox(parent_hwnd, about_text.replace('\r\n', '\n'),
+					  "About FullThumbs", win32con.MB_OK)
+
+# -------
 
 def pip_window_proc(hwnd, msg, wparam, lparam):
 	"""Window procedure for the PiP window."""
@@ -565,22 +573,38 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 			win32gui.DeleteObject(fill_brush)
 
 			if main.g_thumbnail:
-				# 2. Draw the red box around the thumbnail area
-				# Create a red pen (for outline)
+				# Create red pen and null brush for drawing
 				red_pen = win32gui.CreatePen(win32con.PS_SOLID, 2, win32api.RGB(255, 0, 0)) # 2 pixels thick
-				old_pen = win32gui.SelectObject(hdc, red_pen) # Select it into the DC
-				# Create a null brush (for no fill)
+				old_pen = win32gui.SelectObject(hdc, red_pen)
 				null_brush = win32gui.GetStockObject(win32con.NULL_BRUSH)
-				old_brush = win32gui.SelectObject(hdc, null_brush) # Select it into the DC
-				# Draw the rectangle
+				old_brush = win32gui.SelectObject(hdc, null_brush)
+
+				# Get the rect from the thumbnail manager
 				box_left, box_top, box_right, box_bottom = main.g_thumbnail.current_thumb_rect
+				
+				# Draw the rectangle
 				win32gui.Rectangle(hdc, box_left-1, box_top-1, box_right+2, box_bottom+2)
 
+				# If the thumbnail is invalid, draw the cross
+				if not main.g_thumbnail.is_valid:
+					win32gui.MoveToEx(hdc, box_left, box_top)
+					win32gui.LineTo(hdc, box_right, box_bottom)
+					win32gui.MoveToEx(hdc, box_left, box_bottom)
+					win32gui.LineTo(hdc, box_right, box_top)
+
 			else:
+				# No thumbnail yet - use default area
 				box_left, box_top, width, height = get_default_window_area()
 				box_right = box_left + width
 				box_bottom = box_top + height
-				# If no source window is available, draw missing application indicator
+
+				# Create red pen and null brush for drawing
+				red_pen = win32gui.CreatePen(win32con.PS_SOLID, 2, win32api.RGB(255, 0, 0))
+				old_pen = win32gui.SelectObject(hdc, red_pen)
+				null_brush = win32gui.GetStockObject(win32con.NULL_BRUSH)
+				old_brush = win32gui.SelectObject(hdc, null_brush)
+
+				# Draw rectangle and cross
 				win32gui.Rectangle(hdc, box_left-1, box_top-1, box_right+2, box_bottom+2)
 				win32gui.MoveToEx(hdc, box_left, box_top)
 				win32gui.LineTo(hdc, box_right, box_bottom)
@@ -712,6 +736,12 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 				# Set window to minimal mode
 				set_pip_window_style(WINDOW_MODE_MINIMAL)
 				return 0
+			elif cmd_id == MENU_ID_RESTART_THUMBNAIL:
+				# Use the update mechanism to restart
+				from src import main
+				main.g_debug_simulate_update = True
+				check_for_git_updates()
+				return 0
 			else:
 				print(f"Unhandled command ID: {cmd_id}")
 			# NOTE: do not call DefWindowProc for handled commands
@@ -799,8 +829,9 @@ def handle_source_window_status(hwnd):
 		print("Source window is no longer valid or visible. Attempting to find it again...")
 		main.g_source_hwnd = None # Reset the source window handle
 
-		# Unregister the current thumbnail if it exists
-		main.g_thumbnail.cleanup_thumbnail()
+		# Mark the thumbnail as invalid but keep its rect for drawing
+		if main.g_thumbnail:
+			main.g_thumbnail.cleanup_thumbnail()  # This now preserves the rect but marks as invalid
 
 		win32gui.InvalidateRect(main.g_pip_hwnd, None, True)
 
@@ -813,11 +844,8 @@ def handle_source_window_status(hwnd):
 	# Re-register the thumbnail with the new source window
 	print(f"Found source window: {main.g_source_hwnd} ({win32gui.GetWindowText(main.g_source_hwnd)!r})")
 	pip_rect = get_inner_client_rect(main.g_pip_hwnd)
-	main.g_thumbnail.update_thumbnail_rect(pip_rect)
-	# if not g_thumbnail.update_thumbnail_rect(pip_rect):
-	# 	print("Failed to set thumbnail for the new source window.")
-	# else:
-	# 	print("Thumbnail successfully updated for the new source window.")
+	from src.thumbnail import ThumbnailManager
+	main.g_thumbnail = ThumbnailManager(main.g_pip_hwnd, pip_rect, main.g_source_hwnd)
 
 WINDOW_U_FLAGS = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED
 

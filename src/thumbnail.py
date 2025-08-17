@@ -79,6 +79,7 @@ class ThumbnailManager:
 
 		self.thumb_handle = None
 		self.current_thumb_rect = None
+		self.is_valid = True
 
 		self.register_thumbnail()
 	
@@ -128,10 +129,11 @@ class ThumbnailManager:
 			return False
 	
 	def cleanup_thumbnail(self):
-		"""Cleanup thumbnail resources."""
+		"""Cleanup thumbnail resources but preserve the last known position."""
 		if self.thumb_handle:
 			dwmapi_lib.DwmUnregisterThumbnail(self.thumb_handle)
 			self.thumb_handle = None
+			self.is_valid = False  # Mark as invalid but keep current_thumb_rect
 	
 	def check_within_thumbnail_rect(self, x, y):
 		"""Check if coordinates are within thumbnail rectangle."""
