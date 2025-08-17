@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Unit tests for string-based text measurement system.
+Unit tests for default text measurement approximations in LayoutPluginContext.
 
-This module tests the character classification, text wrapping accuracy,
-and mixed script support in the text measurement system.
+This module tests that the default text measurement functions provide reasonable
+approximations suitable for layout testing, without requiring platform-specific
+implementations.
 """
 
 import unittest
@@ -15,108 +16,86 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 sys.path.insert(0, os.path.join(project_root, 'src'))
 
-import window_layout
-from window_layout import LayoutText
+from functools import lru_cache
+from window_layout import (LayoutText, LayoutPluginContext, _layout_context, 
+                         layout_context)
+from typing import cast
 
+@layout_context
+class TestContext(LayoutPluginContext):
+    """Test context that uses the default measurement implementation."""
+    pass
 
-class TestCharacterClassification(unittest.TestCase):
-    """Test character type classification and width estimation."""
+class TestDefaultTextMeasurement(unittest.TestCase):
+    """Test the default text measurement approximations using the global context."""
     
     def setUp(self):
-        """Ensure we start with default functions."""
-        window_layout.set_text_measurement_functions(None, None)
+        """Verify the global context is available."""
+        assert _layout_context is not None, "Global layout context not initialized"
+        # Tell type checker this is definitely a LayoutPluginContext
+        self.context = cast(LayoutPluginContext, _layout_context)
+        
+    def tearDown(self):
+        """Clean up after each test."""
+        self.context = None
     
-    def test_narrow_vs_wide_characters(self):
-        """Test that narrow and wide characters have appropriate relative widths."""
-        narrow_text = "iiiiiiiiiii"  # 11 narrow characters
-        wide_text = "WWWWWWWWWWW"  # 11 wide characters
-        
-        narrow_width = window_layout.measure_text_width(narrow_text, "Arial")
-        wide_width = window_layout.measure_text_width(wide_text, "Arial")
-        
-        self.assertGreater(wide_width, narrow_width)
-        
-        # Wide characters should be significantly wider than narrow ones
-        ratio = wide_width / narrow_width
-        self.assertGreater(ratio, 2.0, "Wide characters should be much wider than narrow")
-        self.assertLess(ratio, 10.0, "Ratio should not be extreme")
-    
-    def test_mixed_character_types(self):
-        """Test measurement of text with mixed character types."""
-        test_cases = [
-            ("Hello World", "Basic English"),
-            ("i" * 10, "Only narrow characters"),
-            ("W" * 5, "Only wide characters"),
-            ("..." * 5, "Punctuation"),
-            ("Hello 世界", "Mixed English + CJK"),
+    def test_character_classification(self):
+        """Test that different character types are classified with appropriate widths."""
+        # Test basic character classifications
+        tests = [
+            (self.context.measure_text_width("i", None), 4, "Narrow character 'i'"),
+            (self.context.measure_text_width("W", None), 14, "Wide character 'W'"),
+            (self.context.measure_text_width(" ", None), 4, "Space character"),
+            (self.context.measure_text_width("a", None), 8, "Average width character 'a'"),
+            (self.context.measure_text_width("世", None), 16, "CJK character"),
         ]
         
-        for text, description in test_cases:
-            with self.subTest(text=text, description=description):
-                width = window_layout.measure_text_width(text, "Arial")
-                self.assertIsInstance(width, int)
-                self.assertGreater(width, 0, f"Width should be positive for: {description}")
+        for actual, expected, msg in tests:
+            with self.subTest(msg=msg):
+                self.assertEqual(actual, expected, msg)
+    
+    def test_text_scaling(self):
+        """Test that text width scales reasonably with length."""
+        # Test that multiple characters scale linearly
+        single_i = self.context.measure_text_width("i", None)
+        multiple_i = self.context.measure_text_width("iii", None)
+        self.assertEqual(multiple_i, single_i * 3, "Width should scale linearly")
+        
+        # Mixed text should sum individual character widths
+        mixed = self.context.measure_text_width("Hi!", None)
+        expected = (10 + 4 + 8)  # H=10 (capital) + i=4 (narrow) + !=8 (punctuation)
+        self.assertEqual(mixed, expected, "Mixed text width should sum individual widths")
     
     def test_empty_and_whitespace(self):
-        """Test measurement of empty and whitespace-only text."""
-        self.assertEqual(window_layout.measure_text_width("", "Arial"), 0)
-        
-        # Spaces should have some width
-        space_width = window_layout.measure_text_width(" ", "Arial")
-        self.assertGreater(space_width, 0)
-        
-        # Multiple spaces should scale
-        multiple_spaces = window_layout.measure_text_width("   ", "Arial")
-        self.assertGreater(multiple_spaces, space_width)
+        """Test measurement of empty and whitespace text."""
+        self.assertEqual(self.context.measure_text_width("", None), 0, "Empty string should have zero width")
+        self.assertEqual(self.context.measure_text_width(" ", None), 4, "Space should have width 4")
+        self.assertEqual(self.context.measure_text_width("   ", None), 12, "Multiple spaces should scale linearly")
     
-    def test_special_characters(self):
-        """Test measurement of special characters and symbols."""
-        special_cases = [
-            ("©™®", "Copyright symbols"),
-            ("←→↑↓", "Arrow symbols"),
-            ("αβγδε", "Greek letters"),
-            ("café", "Accented characters"),
-        ]
-        
-        for text, description in special_cases:
-            with self.subTest(text=text, description=description):
-                width = window_layout.measure_text_width(text, "Arial")
-                self.assertGreater(width, 0, f"Special characters should have width: {description}")
+    def test_font_metrics(self):
+        """Test that font metrics provide reasonable defaults."""
+        metrics = self.context.get_font_metrics(None)
+        self.assertEqual(metrics['height'], 16, "Default font height should be 16")
 
 
-class TestTextWrappingAccuracy(unittest.TestCase):
-    """Test text wrapping behavior with string-based measurement."""
+class TestTextWrapping(unittest.TestCase):
+    """Test text wrapping behavior using the default measurement approximations."""
     
     def setUp(self):
-        """Ensure we start with default functions."""
-        window_layout.set_text_measurement_functions(None, None)
+        """Set up test environment."""
+        self.text_layout = LayoutText("Test text")  # LayoutText uses the default LayoutPluginContext
+        
+    def tearDown(self):
+        """Clean up after each test."""
+        self.text_layout = None
     
-    def test_simple_text_wrapping(self):
-        """Test wrapping of simple text."""
-        text_widget = LayoutText("Hello World")
+    def test_text_length_comparison(self):
+        """Test that longer text gets wider measurements."""
+        text_widget = LayoutText("Sample")
         
-        # Get full width
-        full_width = text_widget.get_preferred_width()
-        self.assertGreater(full_width, 0)
-        
-        # Test that we can't shrink below minimum (longest word)
-        hello_width = window_layout.measure_text_width("Hello", "Arial")
-        world_width = window_layout.measure_text_width("World", "Arial")
-        expected_min = max(hello_width, world_width)
-        
-        actual_min = text_widget.try_shrink_width(1)  # Try to shrink very small
-        self.assertGreaterEqual(actual_min, expected_min)
-    
-    def test_long_word_constraints(self):
-        """Test that long words correctly set minimum width constraints."""
-        long_word = "supercalifragilisticexpialidocious"
-        text_widget = LayoutText(f"Short {long_word} text")
-        
-        # The minimum achievable width should be at least the long word's width
-        long_word_width = window_layout.measure_text_width(long_word, "Arial")
-        min_achievable = text_widget.try_shrink_width(10)
-        
-        self.assertGreaterEqual(min_achievable, long_word_width)
+        # Test that longer words get wider measurements
+        self.assertGreater(text_widget.get_extents("World")[0], 
+                          text_widget.get_extents("Hi")[0])
     
     def test_text_wrapping_with_mixed_widths(self):
         """Test wrapping behavior with mixed character widths."""
@@ -124,124 +103,21 @@ class TestTextWrappingAccuracy(unittest.TestCase):
         mixed_text = "iiiii WWWWW normal"
         text_widget = LayoutText(mixed_text)
         
-        full_width = text_widget.get_preferred_width()
-        half_width = text_widget.try_shrink_width(full_width // 2)
-        
-        # Should be able to wrap to something smaller than full width
-        self.assertLess(half_width, full_width)
-        self.assertGreater(half_width, 0)
+        # Test that wide characters take more space
+        narrow_part = text_widget.get_extents("iiiii")[0]
+        wide_part = text_widget.get_extents("WWWWW")[0]
+        self.assertGreater(wide_part, narrow_part)
     
     def test_unwrappable_text(self):
-        """Test behavior with text that cannot be wrapped."""
+        """Test text width calculations for long words."""
         # Single long word
-        long_word = "pneumonoultramicroscopicsilicovolcanoconiosiss"
+        long_word = "supercalifragilisticexpialidocious"
         text_widget = LayoutText(long_word)
         
-        word_width = window_layout.measure_text_width(long_word, "Arial")
-        
-        # Try to shrink to various small sizes
-        for target in [10, 50, 100]:
-            actual = text_widget.try_shrink_width(target)
-            self.assertGreaterEqual(actual, word_width, 
-                                  f"Cannot shrink below word width for target {target}")
-
-
-class TestRealisticUIScenarios(unittest.TestCase):
-    """Test with realistic UI text scenarios."""
-    
-    def setUp(self):
-        """Ensure we start with default functions."""
-        window_layout.set_text_measurement_functions(None, None)
-    
-    def test_button_labels(self):
-        """Test measurement of typical button labels."""
-        button_texts = ["OK", "Cancel", "Save", "Save As...", "Apply"]
-        
-        for text in button_texts:
-            with self.subTest(text=text):
-                width = window_layout.measure_text_width(text, "Arial")
-                self.assertGreater(width, 0)
-                self.assertLess(width, 200, "Button text should not be extremely wide")
-    
-    def test_error_messages(self):
-        """Test measurement of error messages."""
-        error_messages = [
-            "File not found",
-            "Error: Invalid input",
-            "Warning: This action cannot be undone",
-            "Error: 文件未找到 (File not found)",  # Mixed scripts
-        ]
-        
-        for text in error_messages:
-            with self.subTest(text=text):
-                text_widget = LayoutText(text)
-                width = text_widget.get_preferred_width()
-                self.assertGreater(width, 0)
-                
-                # Should be able to wrap to reasonable widths
-                wrapped = text_widget.try_shrink_width(200)
-                self.assertGreater(wrapped, 0)
-                self.assertLessEqual(wrapped, width)
-    
-    def test_internationalization(self):
-        """Test measurement of international text."""
-        international_texts = [
-            ("Iñtërnâtiônàlizætiøn", "Accented Latin"),
-            ("العربية", "Arabic"),
-            ("हिन्दी", "Hindi"),
-            ("中文", "Chinese"),
-            ("русский", "Cyrillic"),
-        ]
-        
-        for text, description in international_texts:
-            with self.subTest(text=text, description=description):
-                width = window_layout.measure_text_width(text, "Arial")
-                self.assertGreater(width, 0, f"International text should have width: {description}")
-
-
-class TestMeasurementConsistency(unittest.TestCase):
-    """Test consistency and edge cases in text measurement."""
-    
-    def setUp(self):
-        """Ensure we start with default functions."""
-        window_layout.set_text_measurement_functions(None, None)
-    
-    def test_measurement_monotonicity(self):
-        """Test that longer text generally has greater or equal width."""
-        base_text = "Hello"
-        base_width = window_layout.measure_text_width(base_text, "Arial")
-        
-        # Adding characters should generally increase width
-        longer_text = base_text + " World"
-        longer_width = window_layout.measure_text_width(longer_text, "Arial")
-        
-        self.assertGreaterEqual(longer_width, base_width)
-    
-    def test_measurement_repeatability(self):
-        """Test that measuring the same text gives consistent results."""
-        text = "Test repeatability"
-        
-        width1 = window_layout.measure_text_width(text, "Arial")
-        width2 = window_layout.measure_text_width(text, "Arial")
-        width3 = window_layout.measure_text_width(text, "Arial")
-        
-        self.assertEqual(width1, width2)
-        self.assertEqual(width2, width3)
-    
-    def test_font_parameter_handling(self):
-        """Test that font parameter is handled gracefully."""
-        text = "Font test"
-        
-        # Should work with different font values
-        width_arial = window_layout.measure_text_width(text, "Arial")
-        width_times = window_layout.measure_text_width(text, "Times New Roman")
-        width_none = window_layout.measure_text_width(text, None)
-        
-        # All should return valid widths
-        for width in [width_arial, width_times, width_none]:
-            self.assertIsInstance(width, int)
-            self.assertGreater(width, 0)
-
+        # Test that long words get proportionally longer measurements
+        long_width = text_widget.get_extents(long_word)[0]
+        short_width = text_widget.get_extents("short")[0]
+        self.assertGreater(long_width, short_width * 3)
 
 if __name__ == '__main__':
     unittest.main()

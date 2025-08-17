@@ -1,13 +1,117 @@
 """Unit tests for the window_layout module."""
 
+import os
+import sys
 import unittest
+
+# Add parent directory to path when running directly
+if __name__ == '__main__':
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from src.window_layout import (
 	Dimension, Fixed, Expand, Grow,
 	Layout, LayoutSpacer, LayoutText, LayoutButton, LayoutEdit,
 	LayoutContainer, LayoutPadding, LayoutWindow, LayoutGroup,
-	LayoutLink, LayoutHorizontalLine,
+	LayoutLink, LayoutSeparatorLine,
 	build_about_dialog
 )
+
+
+class TestSizeQueryMethods(unittest.TestCase):
+    """Test the interaction between width/height and axis query methods."""
+
+    class BaselineWidget(Layout):
+        """Base widget for testing override patterns."""
+        def __init__(self, width: int = 100, height: int = 50):
+            super().__init__()
+            self.width = width
+            self.height = height
+
+    class WidthHeightWidget(BaselineWidget):
+        """Test widget that overrides individual width/height methods."""
+        def query_width_request(self) -> int:
+            return self.width
+
+        def query_height_request(self) -> int:
+            return self.height
+
+    class AxisWidget(BaselineWidget):
+        """Test widget that overrides query_axis_request."""
+        def query_axis_request(self, axis: int) -> int:
+            return self.width if axis == 0 else self.height
+
+    class MixedWidget(BaselineWidget):
+        """Test widget that overrides both axis and width methods."""
+        def query_width_request(self) -> int:
+            return self.width + 10  # Different value to test priority
+            
+        def query_axis_request(self, axis: int) -> int:
+            # Use our own width query when asking for width
+            if axis == 0:
+                return self.query_width_request()
+            return self.height
+
+    def test_width_height_override(self):
+        """Test widget that overrides width/height query methods."""
+        widget = self.WidthHeightWidget(width=100, height=50)
+        
+        # Check direct width/height methods
+        self.assertEqual(widget.query_width_request(), 100)
+        self.assertEqual(widget.query_height_request(), 50)
+        
+        # Ensure axis method properly routes to width/height methods
+        self.assertEqual(widget.query_axis_request(0), 100)
+        self.assertEqual(widget.query_axis_request(1), 50)
+        
+        # Check space request uses proper routing
+        self.assertEqual(widget.query_space_request(), (100, 50))
+
+    def test_axis_override(self):
+        """Test widget that overrides query_axis_request."""
+        widget = self.AxisWidget(width=100, height=50)
+        
+        # Check axis method directly
+        self.assertEqual(widget.query_axis_request(0), 100)
+        self.assertEqual(widget.query_axis_request(1), 50)
+        
+        # Verify width/height methods properly route through axis
+        self.assertEqual(widget.query_width_request(), 100)
+        self.assertEqual(widget.query_height_request(), 50)
+        
+        # Check space request uses axis method
+        self.assertEqual(widget.query_space_request(), (100, 50))
+
+    def test_mixed_override(self):
+        """Test widget that overrides both axis and width/height."""
+        widget = self.MixedWidget(width=100, height=50)
+        
+        # Width override should take precedence
+        self.assertEqual(widget.query_width_request(), 110)
+        
+        # Axis override for height
+        self.assertEqual(widget.query_height_request(), 50)
+        
+        # Check axis method respects override priority
+        self.assertEqual(widget.query_axis_request(0), 110)
+        self.assertEqual(widget.query_axis_request(1), 50)
+        
+        # Space request should respect override priority
+        self.assertEqual(widget.query_space_request(), (110, 50))
+        
+    def test_override_interaction(self):
+        """Test that changes to one size query method affect all query paths."""
+        widget = self.WidthHeightWidget(width=100, height=50)
+        
+        # Initial state
+        self.assertEqual(widget.query_width_request(), 100)
+        self.assertEqual(widget.query_axis_request(0), 100)
+        self.assertEqual(widget.query_space_request()[0], 100)
+        
+        # Change width and verify all paths update
+        widget.width = 200
+        self.assertEqual(widget.query_width_request(), 200)
+        self.assertEqual(widget.query_axis_request(0), 200)
+        self.assertEqual(widget.query_space_request()[0], 200)
 
 
 class TestDimensionClasses(unittest.TestCase):
@@ -174,13 +278,6 @@ class TestLayoutWidgets(unittest.TestCase):
 	
 	def test_layout_text(self):
 		"""Test LayoutText text measurement."""
-		# Reset to defaults to ensure consistent measurement
-		import sys
-		import os
-		sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
-		import window_layout
-		window_layout.set_text_measurement_functions(None, None)
-		
 		# Test empty text
 		text1 = LayoutText("")
 		self.assertEqual(text1.query_space_request(), (0, 0))
@@ -261,10 +358,11 @@ class TestLayoutWidgets(unittest.TestCase):
 		edit1.set_text("Updated text")
 		self.assertEqual(edit1.get_text(), "Updated text")
 	
-	def test_layout_horizontal_line(self):
-		"""Test LayoutHorizontalLine."""
-		line = LayoutHorizontalLine()
-		self.assertEqual(line.query_space_request(), (0, 1))
+	def test_layout_separator_line(self):
+		"""Test LayoutSeparatorLine."""
+		line = LayoutSeparatorLine(axis=LayoutGroup.HORIZONTAL)
+		self.assertEqual(line.query_width_request(), 0)  # line width is flexible
+		self.assertEqual(line.query_height_request(), 2)  # line needs 2 pixels for etched effect
 
 
 class TestLayoutContainers(unittest.TestCase):
@@ -441,6 +539,12 @@ if __name__ == '__main__':
 	def run_complex_tests():
 		"""Run only the complex layout tests."""
 		suite = unittest.TestLoader().loadTestsFromTestCase(TestComplexLayouts)
+		runner = unittest.TextTestRunner(verbosity=2)
+		runner.run(suite)
+
+	def run_size_query_tests():
+		"""Run only the size query method tests."""
+		suite = unittest.TestLoader().loadTestsFromTestCase(TestSizeQueryMethods)
 		runner = unittest.TextTestRunner(verbosity=2)
 		runner.run(suite)
 	
