@@ -17,7 +17,10 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 sys.path.insert(0, os.path.join(project_root, 'src'))
 
-from window_layout import LayoutText, LayoutLink
+from window_layout import LayoutText, LayoutLink, LayoutPluginContext, layout_context_class
+
+
+layout_context_class(LayoutPluginContext)
 
 
 class TestLayoutTextWidget(unittest.TestCase):

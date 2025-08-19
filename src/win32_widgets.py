@@ -5,7 +5,14 @@ This module provides Win32-specific versions of layout widgets that account for
 native widget characteristics like borders, padding, and system metrics.
 """
 
+from __future__ import annotations
+
 from functools import lru_cache, cached_property
+import ctypes
+from ctypes import windll
+import math
+import sys
+from weakref import WeakValueDictionary
 from window_layout import (
 	Layout,
 	LayoutPluginContext,
@@ -15,12 +22,13 @@ from window_layout import (
 	LayoutSeparatorLine,
 	LayoutContainer,
 	LayoutPadding,
-	layout_context,
+	layout_context_class,
 	Grow,
 	LayoutText,
 	LayoutButton,
 	LayoutEdit,
 	LayoutSpacer,
+	FontObject,
 )
 
 # Cache reset helpers
@@ -31,8 +39,43 @@ import win32gui, win32con, win32api
 
 # Win32 API functions for getting system metrics
 user32 = ctypes.windll.user32
+gdi32 = ctypes.windll.gdi32
 
-# Set up function argument types
+# Define CREATESTRUCT structure for WM_CREATE
+class CREATESTRUCT(ctypes.Structure):
+	_fields_ = [
+		("lpCreateParams", ctypes.c_void_p),
+		("hInstance", wintypes.HANDLE),
+		("hMenu", wintypes.HMENU),
+		("hwndParent", wintypes.HWND),
+		("cy", wintypes.INT),
+		("cx", wintypes.INT),
+		("y", wintypes.INT),
+		("x", wintypes.INT),
+		("style", wintypes.LONG),
+		("lpszName", wintypes.LPCWSTR),
+		("lpszClass", wintypes.LPCWSTR),
+		("dwExStyle", wintypes.DWORD),
+	]
+
+# Define PAINTSTRUCT structure
+class PAINTSTRUCT(ctypes.Structure):
+	_fields_ = [
+		("hdc", wintypes.HDC),
+		("fErase", wintypes.BOOL),
+		("rcPaint", wintypes.RECT),
+		("fRestore", wintypes.BOOL),
+		("fIncUpdate", wintypes.BOOL),
+		("rgbReserved", wintypes.BYTE * 32),
+	]
+
+# Set up BeginPaint/EndPaint function types
+user32.BeginPaint.argtypes = [wintypes.HWND, ctypes.POINTER(PAINTSTRUCT)]
+user32.BeginPaint.restype = wintypes.HDC
+user32.EndPaint.argtypes = [wintypes.HWND, ctypes.POINTER(PAINTSTRUCT)]
+user32.EndPaint.restype = wintypes.BOOL
+
+# Set up function argument types for CreateWindowExW
 user32.CreateWindowExW.argtypes = [
 	wintypes.DWORD,		# dwExStyle
 	wintypes.LPCWSTR,	# lpClassName
@@ -49,6 +92,463 @@ user32.CreateWindowExW.argtypes = [
 ]
 user32.CreateWindowExW.restype = wintypes.HWND
 
+# Set up GetWindowLongPtrW/SetWindowLongPtrW for window instance storage
+if hasattr(ctypes.c_void_p, '_type_'):
+	# 64-bit Python
+	LONG_PTR = ctypes.c_void_p
+else:
+	# 32-bit Python
+	LONG_PTR = ctypes.c_long
+
+user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.GetWindowLongPtrW.restype = LONG_PTR
+user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, LONG_PTR]
+user32.SetWindowLongPtrW.restype = LONG_PTR
+
+# Set up InvalidateRect
+user32.InvalidateRect.argtypes = [
+	wintypes.HWND,      # hWnd
+	wintypes.LPRECT,    # lpRect
+	wintypes.BOOL       # bErase
+]
+user32.InvalidateRect.restype = wintypes.BOOL
+
+# Set up GetDeviceCaps
+gdi32.GetDeviceCaps.argtypes = [wintypes.HDC, ctypes.c_int]
+gdi32.GetDeviceCaps.restype = ctypes.c_int
+
+
+class Win32FontBase:
+	"""Base class for Win32 font objects.
+	
+	This class provides the common interface and properties for both system fonts
+	and created fonts.
+	
+	Attributes:
+		handle: The Win32 HFONT handle
+		face_name: Font family name
+		size: Size in points if positive, or direct height in logical units if negative
+		bold: Whether the font is bold
+		italic: Whether the font is italic
+		underline: Whether the font is underlined
+	"""
+	
+	def __init__(self, hfont: int, face_name: str, size: int, bold: bool, italic: bool, underline: bool):
+		"""Initialize font properties."""
+		self._hfont = hfont
+		self._face_name = face_name
+		self._size = size
+		self._bold = bold
+		self._italic = italic
+		self._underline = underline
+	
+	@property
+	def handle(self) -> int:
+		"""Get the Win32 font handle."""
+		return self._hfont
+	
+	def replace(self, face_name: str | None = None, size: int | None = None, *,
+			   bold: bool | None = None, italic: bool | None = None, 
+			   underline: bool | None = None) -> 'Win32Font':
+		"""Create a new font based on this one, with some properties changed."""
+		# Use current values for any unspecified properties
+		new_face = face_name if face_name is not None else self._face_name
+		new_size = size if size is not None else self._size
+		new_bold = bold if bold is not None else self._bold
+		new_italic = italic if italic is not None else self._italic
+		new_underline = underline if underline is not None else self._underline
+		
+		# Create font - caching will handle the case of unchanged properties
+		return Win32Font.create(new_face, new_size, bold=new_bold, 
+							  italic=new_italic, underline=new_underline)
+
+
+class LOGFONT(ctypes.Structure):
+	"""Win32 LOGFONT structure for getting/setting font information."""
+	_fields_ = [
+		("lfHeight", ctypes.c_long),
+		("lfWidth", ctypes.c_long),
+		("lfEscapement", ctypes.c_long),
+		("lfOrientation", ctypes.c_long),
+		("lfWeight", ctypes.c_long),
+		("lfItalic", ctypes.c_byte),
+		("lfUnderline", ctypes.c_byte),
+		("lfStrikeOut", ctypes.c_byte),
+		("lfCharSet", ctypes.c_byte),
+		("lfOutPrecision", ctypes.c_byte),
+		("lfClipPrecision", ctypes.c_byte),
+		("lfQuality", ctypes.c_byte),
+		("lfPitchAndFamily", ctypes.c_byte),
+		("lfFaceName", ctypes.c_wchar * 32)
+	]
+
+
+class Win32SystemFont(Win32FontBase):
+	"""Represents a system font object in Win32.
+	
+	These fonts are managed by Windows and should not be deleted when this object
+	is destroyed. System fonts are cached both by their handle and properties to
+	ensure consistent reuse.
+	"""
+	
+	# Cache of font handles to system font instances.
+	# Uses a regular dict since these are permanent system resources we want to keep cached
+	_handle_cache = {}
+	
+	# Map of stock object IDs that are fonts to their names
+	_STOCK_FONTS = None  # Will be populated by _init_stock_fonts()
+	
+	@classmethod
+	def _init_stock_fonts(cls) -> dict[str, int]:
+		"""Initialize the map of stock font objects.
+		
+		Instead of probing for fonts (which can return false positives),
+		we'll use the known stock font IDs from Windows. These are documented
+		and guaranteed to be fonts when they exist.
+		"""
+		if cls._STOCK_FONTS is not None:
+			return cls._STOCK_FONTS
+		
+		# Map of known stock fonts to their ID values (from wingdi.h)
+		known_fonts = {
+			"OEM_FIXED": 10,       # Terminal
+			"ANSI_FIXED": 11,      # Courier
+			"ANSI_VAR": 12,        # MS Sans Serif
+			"SYSTEM": 13,          # System
+			"DEVICE_DEFAULT": 14,   # Device Default
+			"SYSTEM_FIXED": 16,     # System Fixed
+			"DEFAULT_GUI": 17       # Segoe UI on modern Windows
+		}
+		
+		# Only include fonts that exist and can be wrapped
+		found_fonts = {}
+		for name, stock_id in known_fonts.items():
+			try:
+				# Try to get the font handle
+				handle = win32gui.GetStockObject(stock_id)
+				if not handle:
+					continue
+					
+				# Try to create a font wrapper - this will validate the font
+				# and cache it in both handle and property caches
+				font = cls.from_handle(handle)
+				if font is None:
+					continue
+					
+				# Add to our stock font mapping
+				found_fonts[name] = stock_id
+			except:
+				pass  # Skip any that fail
+		
+		cls._STOCK_FONTS = found_fonts
+		return found_fonts
+	
+	@staticmethod
+	def from_handle(hfont: int) -> 'Win32SystemFont | None':
+		"""Create a system font wrapper from an HFONT handle.
+		
+		Args:
+			hfont: HFONT handle to wrap
+			
+		Returns:
+			Win32SystemFont instance or None if handle is invalid
+			
+		Note:
+			Results are cached by handle. The same handle will always return
+			the same Win32SystemFont instance.
+		"""
+		# Check cache first
+		cached = Win32SystemFont._handle_cache.get(hfont)
+		if cached is not None:
+			return cached
+		
+		# Get font information using GetObject
+		lf = LOGFONT()
+		try:
+			if not windll.gdi32.GetObjectW(hfont, ctypes.sizeof(LOGFONT), ctypes.byref(lf)):
+				return None
+		except:
+			return None  # Invalid font handle		# Get device context for DPI calculation
+		hdc = win32gui.GetDC(0)
+		try:
+			# Convert logical height to points
+			dpi = gdi32.GetDeviceCaps(hdc, win32con.LOGPIXELSY)
+			if lf.lfHeight < 0:
+				size = int((-lf.lfHeight * 72.0) / dpi)
+			else:
+				size = lf.lfHeight  # Use height directly if positive
+		finally:
+			win32gui.ReleaseDC(0, hdc)
+		
+		# Create font properties
+		face_name = lf.lfFaceName
+		bold = lf.lfWeight >= win32con.FW_BOLD
+		italic = bool(lf.lfItalic)
+		underline = bool(lf.lfUnderline)
+		
+		# Check the Win32Font cache first - maybe we already have a font with these properties
+		cache_key = Win32Font._make_cache_key(face_name, size, bold, italic, underline)
+		font = Win32Font._active_fonts.get(cache_key)
+		if font is not None:
+			return font
+		
+		# Create new system font instance
+		font = Win32SystemFont(
+			hfont=hfont,
+			face_name=face_name,
+			size=size,
+			bold=bold,
+			italic=italic,
+			underline=underline
+		)
+		
+		# Cache by both handle and properties
+		Win32SystemFont._handle_cache[hfont] = font
+		Win32Font._active_fonts[cache_key] = font
+		
+		return font
+	
+	@classmethod
+	def get_stock_font(cls, name: str) -> 'Win32SystemFont':
+		"""Get a stock font by name.
+		
+		Args:
+			name: Name of the stock font from _STOCK_FONTS
+			
+		Returns:
+			Win32SystemFont instance for the requested stock font
+			
+		Raises:
+			KeyError: If the name is not a known stock font
+			WindowsError: If the font could not be retrieved
+		"""
+		# Initialize stock fonts if needed
+		stock_fonts = cls._init_stock_fonts()
+		
+		stock_id = stock_fonts.get(name)
+		if stock_id is None:
+			raise KeyError(f"Unknown stock font: {name}. Must be one of {list(stock_fonts.keys())}")
+		
+		hfont = win32gui.GetStockObject(stock_id)
+		if not hfont:
+			raise WindowsError(f"Failed to get stock font: {name}")
+		
+		font = cls.from_handle(hfont)
+		if font is None:
+			raise WindowsError(f"Failed to create font wrapper for stock font: {name}")
+		
+		return font
+	
+	@classmethod
+	def get_default_gui_font(cls) -> 'Win32SystemFont':
+		"""Get the default GUI font used by Windows."""
+		return cls.get_stock_font("DEFAULT_GUI")
+	
+	@classmethod
+	def enumerate_stock_fonts(cls) -> list['Win32SystemFont']:
+		"""Get a list of all available stock fonts.
+		
+		This enumerates all stock objects that are fonts, detecting which ones
+		are available in the current Windows version.
+		
+		Returns:
+			List of Win32SystemFont instances for each available stock font
+		"""
+		# Initialize stock fonts if needed
+		stock_fonts = cls._init_stock_fonts()
+		
+		fonts = []
+		for name in stock_fonts:
+			try:
+				fonts.append(cls.get_stock_font(name))
+			except WindowsError:
+				pass  # Skip fonts that fail to load
+		return fonts
+
+
+class Win32Font(Win32FontBase):
+	"""Represents a created font in Win32 API format.
+	
+	This class creates and manages its own font handles, which are automatically
+	cleaned up when no longer needed. Font instances are cached using both a 
+	WeakValueDictionary (for active fonts) and an LRU cache (for recently used fonts).
+	"""
+	
+	# Cache of currently active font instances
+	_active_fonts = WeakValueDictionary()
+	
+	# Cache key generator
+	@staticmethod
+	def _make_cache_key(face_name: str, size: int, bold: bool, italic: bool, underline: bool) -> tuple:
+		"""Create a cache key for font lookups."""
+		return (face_name.lower(), size, bold, italic, underline)
+	
+	@classmethod
+	@lru_cache(maxsize=32)  # Keep the last 32 fonts in the LRU cache
+	def _create_font(cls, face_name: str, size: int, bold: bool, 
+					italic: bool, underline: bool) -> Win32Font:
+		"""Internal method to create a new font instance."""
+		# Get device context for DPI awareness
+		hdc = win32gui.GetDC(0)
+		
+		try:
+			# If size is negative, use it directly as height
+			# If positive, convert from points to logical units
+			height = size if size < 0 else -int(size * gdi32.GetDeviceCaps(hdc, win32con.LOGPIXELSY) / 72.0)
+			
+			# Create font using CreateFontW (same method used in window_main.py)
+			hfont = windll.gdi32.CreateFontW(
+				height,         # Height (negative for character height)
+				0,             # Width (0 = default)
+				0,             # Escapement
+				0,             # Orientation
+				win32con.FW_BOLD if bold else win32con.FW_NORMAL,  # Weight
+				int(italic),   # Italic
+				int(underline), # Underline
+				0,             # StrikeOut
+				win32con.DEFAULT_CHARSET,  # CharSet
+				win32con.OUT_DEFAULT_PRECIS,  # OutPrecision
+				win32con.CLIP_DEFAULT_PRECIS,  # ClipPrecision
+				win32con.DEFAULT_QUALITY,  # Quality
+				win32con.DEFAULT_PITCH | win32con.FF_DONTCARE,  # PitchAndFamily
+				face_name      # FaceName
+			)
+			
+			if not hfont:
+				raise WindowsError(f"Failed to create font: {face_name}")
+			
+			return cls(hfont, face_name, size, bold, italic, underline)
+		finally:
+			win32gui.ReleaseDC(0, hdc)
+	
+	@classmethod
+	def create(cls, face_name: str, size: int = 10, *, bold: bool = False, 
+			   italic: bool = False, underline: bool = False) -> Win32Font:
+		"""Create a font with the specified properties.
+		
+		Args:
+			face_name: Font family name (e.g. "Segoe UI", "Arial")
+			size: Font size in points if positive, or direct character height in logical units if negative
+			bold: Whether the font is bold
+			italic: Whether the font is italic
+			underline: Whether the font is underlined
+		"""
+		# Initialize stock fonts first to ensure they're in the cache
+		Win32SystemFont._init_stock_fonts()
+		
+		# Create cache key
+		cache_key = cls._make_cache_key(face_name, size, bold, italic, underline)
+		
+		# First check the weak reference cache for an active instance
+		font = cls._active_fonts.get(cache_key)
+		if font is not None:
+			return font
+		
+		# If not in active cache, create new instance (will use LRU cache)
+		font = cls._create_font(face_name, size, bold, italic, underline)
+		
+		# Add to active cache
+		cls._active_fonts[cache_key] = font
+		
+		return font
+	
+	def __del__(self):
+		"""Clean up the font when the object is destroyed."""
+		if getattr(self, '_hfont', None):
+			try:
+				win32gui.DeleteObject(self._hfont)
+			except Exception:
+				pass  # Ignore errors during cleanup
+
+
+class Win32Color:
+	"""Represents a color in Win32 API format.
+	
+	This class encapsulates color handling for Win32 widgets, providing
+	convenient ways to specify colors and converting them to the
+	Win32 RGB format.
+	"""
+	__slots__ = ('value', '_name')
+	
+	from win32_colors import NAMED_COLORS
+	
+	# Class variables for static colors
+	black: Win32Color = None  # type: ignore
+	white: Win32Color = None  # type: ignore
+	
+	def __init__(self, value: int):
+		"""Create a color from a Win32 RGB value."""
+		self.value = value
+		self._name = None  # Cached color name, if it matches a named color
+	
+	@property
+	def r(self) -> int:
+		"""Red component (0-255)"""
+		return self.value & 0xFF
+	
+	@property
+	def g(self) -> int:
+		"""Green component (0-255)"""
+		return (self.value >> 8) & 0xFF
+	
+	@property
+	def b(self) -> int:
+		"""Blue component (0-255)"""
+		return (self.value >> 16) & 0xFF
+	
+	@classmethod
+	def lookup_name(cls, r: int, g: int, b: int) -> str | None:
+		"""Get the name of a color if it matches a named color, otherwise None."""
+		rgb = (r, g, b)
+		for name, named_rgb in cls.NAMED_COLORS.items():
+			if named_rgb == rgb:
+				return name
+		return None
+	
+	@classmethod
+	def from_name(cls, name: str) -> Win32Color:
+		"""Create a color from a CSS color name."""
+		name = name.lower()
+		if name not in cls.NAMED_COLORS:
+			raise ValueError(f"Unknown color name: {name}")
+		r, g, b = cls.NAMED_COLORS[name]
+		color = cls.from_rgb(r, g, b)
+		color._name = sys.intern(name)  # Cache the name since we know it
+		return color
+	
+	@classmethod
+	def from_rgb(cls, r: int, g: int, b: int) -> Win32Color:
+		"""Create a color from RGB values (0-255)."""
+		r = max(0, min(255, int(r)))
+		g = max(0, min(255, int(g)))
+		b = max(0, min(255, int(b)))
+		color = cls(win32api.RGB(r, g, b))
+		return color
+	
+	def __repr__(self) -> str:
+		"""Get a string representation."""
+		if self._name is None:
+			self._name = self.lookup_name(self.r, self.g, self.b) or False
+		if self._name:
+			return f"Win32Color.from_name('{self._name}')"
+		return f"Win32Color.from_rgb({self.r}, {self.g}, {self.b})"
+
+
+# Initialize static color instances after class definition
+Win32Color.black = Win32Color.from_name('black')
+Win32Color.white = Win32Color.from_name('white')
+
+
+def format_size(size: int) -> str:
+	"""Format a file size into a human-readable string."""
+	float_size = float(size)  # Convert to float for division
+	for unit in ('bytes', 'KB', 'MB', 'GB', 'TB'):
+		if float_size < 1024:
+			return f"{float_size:.1f} {unit}" if float_size % 1 != 0 else f"{int(float_size)} {unit}"
+		float_size /= 1024
+	return f"{float_size:.1f} PB"
+
+
 # -------
 
 class Win32Widget(LayoutWidget):
@@ -56,24 +556,72 @@ class Win32Widget(LayoutWidget):
 	
 	def __init__(self):
 		self._hwnd = None
+		self._window = None  # Reference to containing Win32Window
+	
+	def handle_message(self, hwnd: int, msg: int, wparam: int, lparam: int) -> int | None:
+		"""Handle a window message sent to this widget.
+		
+		Args:
+			hwnd: Window handle message was sent to
+			msg: Message identifier
+			wparam: First message parameter
+			lparam: Second message parameter
+			
+		Returns:
+			int if message was handled, None to allow default processing
+		"""
+		return None
+	
+	def invalidate_window(self, rect=None, erase=True):
+		"""Invalidate this widget's window or a region of it.
+		
+		Args:
+			rect: Optional tuple of (left, top, right, bottom) or None for entire window
+			erase: Whether to erase the background
+		"""
+		if self._hwnd is None:
+			return  # No window to invalidate yet
+		
+		if rect is None:
+			# Try invalidating entire window
+			result = user32.InvalidateRect(self._hwnd, None, erase)
+		else:
+			# Use specified rectangle
+			client_r = wintypes.RECT(rect[0], rect[1], rect[2], rect[3])
+			result = user32.InvalidateRect(self._hwnd, ctypes.byref(client_r), erase)
+		
+		if not result:
+			raise ctypes.WinError()
 	
 	def position_at(self, x: int, y: int, data=None) -> None:
 		"""Position the widget relative to the parent window's client area.
-		The data parameter is expected to contain parent_hwnd for Win32 widgets."""
+		The data parameter is expected to contain:
+		- parent_hwnd: Parent window handle
+		- window: Win32Window instance for message dispatch
+		"""
 		super().position_at(x, y, data)
 		
-		# If we have a window handle, update its position
-		if self._hwnd:
-			try:
-				width = self._computed_size[0]
-				height = self._computed_size[1]
-				win32gui.MoveWindow(self._hwnd, x, y, width, height, True)
-			except Exception as e:
-				print(f"Error positioning {type(self).__name__}: {e}")
-		# Create native widget if this is our first positioning and we have a parent
-		elif data is not None and isinstance(data, dict) and 'parent_hwnd' in data:
-			parent_hwnd = data['parent_hwnd']
-			self._create_native_widget(parent_hwnd, x, y)
+		if isinstance(data, dict):
+			# Store window reference for message dispatch
+			if 'window' in data:
+				self._window = data['window']
+			
+			# If we have a window handle, update its position
+			if self._hwnd:
+				try:
+					width = self._computed_size[0]
+					height = self._computed_size[1]
+					win32gui.MoveWindow(self._hwnd, x, y, width, height, False)  # Don't repaint immediately
+					self.invalidate_window()  # Mark as needing repaint
+				except Exception as e:
+					print(f"Error positioning {type(self).__name__}: {e}")
+				
+			# Create native widget if this is our first positioning and we have a parent
+			elif 'parent_hwnd' in data and 'window' in data:
+				parent_hwnd = data['parent_hwnd']
+				self._window = data['window']  # Store window reference before creating widget
+				self._create_native_widget(parent_hwnd, x, y)
+				# Widget map registration now happens in _create_native_widget
 	
 	def _create_native_widget(self, parent_hwnd, x, y):
 		"""Create the native Win32 widget. Override in derived classes."""
@@ -81,7 +629,7 @@ class Win32Widget(LayoutWidget):
 
 # -------
 
-@layout_context
+@layout_context_class
 class Win32LayoutContext(LayoutPluginContext):
 	"""Win32-specific layout context that provides Win32 widgets and measurement."""
 	
@@ -114,39 +662,73 @@ class Win32LayoutContext(LayoutPluginContext):
 	
 	# ---
 
-	def create_text(self, text, font=None, color=None):
-		"""Create a Win32Text widget."""
+	def create_text(self, text: str, font: FontObject | None = None, color: Win32Color | None = None) -> Win32Text:
+		"""Create a Win32Text widget.
+		
+		Args:
+			text: Text to display
+			font: Font specification (string face name or Win32Font instance) or None to use default GUI font
+			color: Text color or None for black
+			
+		Returns:
+			New Win32Text widget instance
+		"""
 		return Win32Text(text, font, color)
 	
-	@lru_cache
-	def measure_text_width(self, text, font=None):
-		"""Win32-specific text width measurement using GDI."""
-		dc = self._get_measurement_dc()
+	@staticmethod
+	def _select_font(dc: int, font: Win32FontBase | int | None = None) -> None:
+		"""Select a font into a device context, falling back to default GUI font if needed.
 		
-		# Select font if provided, otherwise use default GUI font
-		if font:
-			win32gui.SelectObject(dc, font)
+		Args:
+			dc: Device context handle
+			font: Win32Font/Win32SystemFont instance, HFONT handle, or None for default GUI font
+		"""
+		if font is not None:
+			# If it's a font instance, use its handle
+			if isinstance(font, Win32FontBase):
+				win32gui.SelectObject(dc, font.handle)
+			# Otherwise assume it's an HFONT handle
+			else:
+				win32gui.SelectObject(dc, font)
 		else:
-			dialog_font = win32gui.GetStockObject(17)  # DEFAULT_GUI_FONT
-			if dialog_font:
-				win32gui.SelectObject(dc, dialog_font)
+			# Get the default GUI font as a system font
+			default_font = Win32SystemFont.get_default_gui_font()
+			win32gui.SelectObject(dc, default_font.handle)
+	
+	@lru_cache
+	def measure_text_width(self, text: str, font: Win32Font | None = None) -> int:
+		"""Win32-specific text width measurement using GDI.
+		
+		Args:
+			text: The text to measure
+			font: Win32Font instance or None to use default GUI font
+			
+		Returns:
+			Width of the text in pixels
+		"""
+		dc = self._get_measurement_dc()
+		print(f"Measuring text width: '{text}'")
+		
+		self._select_font(dc, font)
 		
 		# Measure text width
 		text_size = win32gui.GetTextExtentPoint32(dc, text or ' ')
+		print(f"  -> Width: {text_size[0]}")
 		return text_size[0]
 	
 	@lru_cache
-	def get_font_metrics(self, font=None):
-		"""Win32-specific font metrics using GDI."""
+	def get_font_metrics(self, font: Win32Font | None = None) -> dict[str, int]:
+		"""Win32-specific font metrics using GDI.
+		
+		Args:
+			font: Win32Font instance or None to use default GUI font
+			
+		Returns:
+			Dictionary with height, ascent, and descent values in pixels
+		"""
 		dc = self._get_measurement_dc()
 		
-		# Select font if provided, otherwise use default GUI font
-		if font:
-			win32gui.SelectObject(dc, font)
-		else:
-			dialog_font = win32gui.GetStockObject(17)  # DEFAULT_GUI_FONT
-			if dialog_font:
-				win32gui.SelectObject(dc, dialog_font)
+		self._select_font(dc, font)
 		
 		# Get font height using a sample character
 		text_size = win32gui.GetTextExtentPoint32(dc, 'Mg')  # Mixed case for ascent/descent
@@ -164,24 +746,84 @@ class Win32LayoutContext(LayoutPluginContext):
 # -------
 
 class Win32Text(Win32Widget, LayoutText):
-	"""Win32-specific text that will use actual Win32 text measurement when implemented."""
+	"""Win32-specific text that uses GDI text measurement and drawing."""
 	
-	def __init__(self, text: str, font: str | None = None, color: str | None = None):
+	def __init__(self, text: str, font: FontObject | None = None, color: Win32Color | None = None):
 		LayoutText.__init__(self, text, font)
 		Win32Widget.__init__(self)
 		self._hwnd: int | None = None
-		self.color = color
+		self.color = Win32Color.black if color is None else color
+		# Convert string font specs to Win32Font instances
+		if isinstance(font, str):
+			self.font = Win32Font.create(font)  # Use default size/style
+		elif not (font is None or isinstance(font, Win32Font)):
+			raise TypeError("font must be None, a string (face name), or a Win32Font instance")
 	
+	def handle_message(self, hwnd: int, msg: int, wparam: int, lparam: int) -> int | None:
+		"""Handle window messages for this text control."""
+		if msg == win32con.WM_CTLCOLORSTATIC and lparam == self._hwnd:
+			hdc = wparam
+			# Set text color and transparent background
+			win32gui.SetTextColor(hdc, self.color.value)
+			win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
+			# Use hollow brush for transparent background
+			return win32gui.GetStockObject(win32con.HOLLOW_BRUSH)
+		return super().handle_message(hwnd, msg, wparam, lparam)
+
 	def _create_native_widget(self, parent_hwnd, x, y):
-		"""Create a native Win32 static text control."""
-		self._hwnd = win32gui.CreateWindow(
-			"STATIC",  # Window class
-			self.text,
-			win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.SS_LEFT,
-			x, y, self._computed_size[0], self._computed_size[1],
-			parent_hwnd, 0, win32api.GetModuleHandle(None), None
-		)
-		return self._hwnd
+		"""Create a native static control."""
+		width = max(self._computed_size[0], self.query_width_request())		# -- FIXME : our computed size should be solid by this point
+		height = max(self._computed_size[1], self.query_height_request())	#	- though it's 300, which is rather suspicious
+		
+		try:
+			self._hwnd = win32gui.CreateWindow(
+				"STATIC",  # Window class
+				self.text,  # Initial text
+				win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.SS_LEFT,
+				x, y, width, height,
+				parent_hwnd, 0, win32api.GetModuleHandle(None), None
+			)
+			
+			if not self._hwnd:
+				print(f"Failed to create text control: error {win32api.GetLastError()}")
+				return self._hwnd
+				
+			# Register with window's widget map immediately after creation
+			if self._window is not None:
+				self._window._widget_map[self._hwnd] = self
+			
+			# Set font (either custom or default GUI font)
+			try:
+				if self.font:
+					# Use the Win32Font instance directly
+					win32gui.SendMessage(self._hwnd, win32con.WM_SETFONT, self.font.handle, 0)
+				else:
+					# Default GUI font if no font specified
+					default_font = win32gui.GetStockObject(17)  # DEFAULT_GUI_FONT
+					if default_font:
+						win32gui.SendMessage(self._hwnd, win32con.WM_SETFONT, default_font, 0)
+			except Exception as e:
+				print(f"Error setting font: {e}")
+			
+			# Make sure the text is visible initially
+			# win32gui.UpdateWindow(self._hwnd)
+			win32gui.SendMessage(self._hwnd, win32con.WM_PAINT, 0, 0)  # Queue a paint message
+			
+			return self._hwnd
+			
+		except Exception as e:
+			print(f"Error creating text window: {e}")
+			raise
+	
+	def set_text(self, text: str):
+		"""Update the text and trigger a redraw."""
+		self.text = text
+		if self._hwnd:
+			# Update text and queue redraw
+			text_buffer = str(self.text).encode('utf-16le')
+			win32gui.SendMessage(self._hwnd, win32con.WM_SETTEXT, 0, text_buffer)
+			self.invalidate_window()  # Mark as needing repaint
+			# win32gui.SendMessage(self._hwnd, win32con.WM_PAINT, 0, 0)  # Force immediate paint if InvalidateRect fails
 
 class Win32Button(Win32Widget, LayoutButton):
 	"""Win32-specific button that accounts for native button characteristics."""
@@ -292,21 +934,9 @@ class Win32Padding(LayoutPadding):
 	pass
 
 class Win32SeparatorLine(Win32Widget, LayoutSeparatorLine):
-	def __init__(self, *, axis=LayoutGroup.HORIZONTAL):
-		LayoutSeparatorLine.__init__(self, axis=axis)
+	def __init__(self, *, axis=LayoutGroup.HORIZONTAL, thickness=2, width=None, height=None):
+		LayoutSeparatorLine.__init__(self, axis=axis, thickness=thickness, width=width, height=height)
 		Win32Widget.__init__(self)
-	
-	def query_width_request(self):
-		# For vertical lines, we need 2 pixels for the etched effect
-		# For horizontal lines, we want 0 to allow growth
-		width = super().query_width_request()
-		return width * 2 if width > 0 else width
-	
-	def query_height_request(self):
-		# For horizontal lines, we need 2 pixels for the etched effect
-		# For vertical lines, we want 0 to allow growth
-		height = super().query_height_request()
-		return height * 2 if height > 0 else height
 	
 	def _create_native_widget(self, parent_hwnd, x, y):
 		"""Create a native Win32 separator line control."""
@@ -354,11 +984,12 @@ class Win32Window(LayoutWindow):
 	_window_class_registered = False
 	_window_count = 0
 	_window_class_name = "Win32LayoutWindow"  # Class name used for registration and creation
-	_window_proc = None  # Store window procedure to prevent garbage collection
-
+	_window_map = {}  # Strong reference map of window handles to instances
+	
 	def __init__(self, child=None, title="Win32 Window", width=None, height=None, client_origin=True):
 		super().__init__(child)
 		self.title = title
+		self._initial_layout_done = False
 		
 		# Store initial size (None is valid for either dimension)
 		self.initial_size = (width, height)
@@ -369,69 +1000,150 @@ class Win32Window(LayoutWindow):
 		
 		self._hwnd = None
 		
+		# Map of window handles to widget instances
+		self._widget_map = WeakValueDictionary()
+		
 		# Register window class if not already done
 		if not Win32Window._window_class_registered:
 			self._register_window_class()
 			Win32Window._window_class_registered = True
 	
 	@staticmethod
-	def _register_window_class():
-		"""Register the window class for Win32Window instances."""
-		# Define window procedure
-		@WNDPROC
-		def window_proc(hwnd, msg, wparam, lparam):
-			"""Window procedure that handles window messages."""
+	def _get_instance_from_hwnd(hwnd: int) -> 'Win32Window':
+		"""Get the Python window instance associated with a window handle."""
+		try:
+			return Win32Window._window_map[hwnd]
+		except KeyError:
+			raise RuntimeError(f"No window instance found for handle {hwnd}")
+	
+	@staticmethod
+	@WNDPROC
+	def _window_proc(hwnd, msg, wparam, lparam):
+		"""Window procedure that handles window messages."""
+		try:
+			# Special handling for messages that occur before window instance exists
+			if msg == win32con.WM_GETMINMAXINFO:  # 0x0024 (36)
+				# Check if we have an instance yet
+				if hwnd not in Win32Window._window_map:
+					# No instance yet, use default handling
+					return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+			elif msg == win32con.WM_NCCALCSIZE:  # 0x0081 (129)
+				# Let Windows calculate default non-client area
+				return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+			elif msg == win32con.WM_NCCREATE:  # 0x0083 (131)
+				# First message that contains creation parameters - perfect time to set up our instance
+				create_struct = ctypes.cast(lparam, ctypes.POINTER(CREATESTRUCT)).contents
+				instance_ptr = ctypes.cast(create_struct.lpCreateParams, 
+										ctypes.POINTER(ctypes.py_object))
+				# Store the instance in our map right away
+				window = instance_ptr.contents.value
+				Win32Window._window_map[hwnd] = window
+				print(f"Window instance set up during WM_NCCREATE for {hwnd}")
+				# Let Windows finish non-client creation
+				return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+			elif msg == win32con.WM_DESTROY:
+				print("Window destroying")
+				win32gui.PostQuitMessage(0)
+				return 0
+			elif msg == win32con.WM_NCDESTROY:
+				print("Window non-client area destroying")
+				# Clean up our instance map only after all messages are processed
+				Win32Window._window_map.pop(hwnd, None)
+				return 0
+			
+			# For all other messages, first try to find the target window/widget
 			try:
-				if msg == win32con.WM_CREATE:
-					print("Window created")
-					return 0
-				elif msg == win32con.WM_DESTROY:
-					print("Window destroying")
-					win32gui.PostQuitMessage(0)
-					return 0
-				elif msg == win32con.WM_SIZE:
-					width = win32api.LOWORD(lparam)
-					height = win32api.HIWORD(lparam)
-					print(f"WM_SIZE: {width}x{height} (client area)")
-					
-					# Handle resize in associated window instance
-					window_instance = None
-					for obj in Win32Window._get_all_instances():
-						if hasattr(obj, '_hwnd') and obj._hwnd == hwnd:
-							window_instance = obj
-							break
-					
-					if window_instance:
-						window_instance._handle_resize(width, height)
+				# Get window instance from our map
+				window = Win32Window._get_instance_from_hwnd(hwnd)
+				
+				# For control notifications (WM_CTLCOLOR*, WM_COMMAND, etc.)
+				# try to dispatch to the control first since it has the most context
+				if msg >= win32con.WM_CTLCOLORMSGBOX and msg <= win32con.WM_CTLCOLORSTATIC:
+					# For these messages:
+					# - hwnd is parent window handle
+					# - wparam is HDC
+					# - lparam is control handle
+					widget = window._widget_map.get(lparam)
+					if widget:
+						result = widget.handle_message(hwnd, msg, wparam, lparam)
+						if result is not None:
+							return result
+				elif msg == win32con.WM_COMMAND:
+					# For command messages:
+					# - hwnd is parent window handle
+					# - HIWORD(wparam) is notification code
+					# - LOWORD(wparam) is control ID
+					# - lparam is control handle
+					if lparam:  # Only for control notifications (not menu/accelerator)
+						widget = window._widget_map.get(lparam)
+						if widget:
+							result = widget.handle_message(hwnd, msg, wparam, lparam)
+							if result is not None:
+								return result
+				
+				# Let the window handle any message (including unhandled control messages)
+				result = window.handle_message(hwnd, msg, wparam, lparam)
+				if result is not None:
+					return result
+				
+				# Special post-dispatch handling for certain messages
+				if msg == win32con.WM_SIZE:
+					# Update layout if size message wasn't handled
+					# Forward any existing layout data
+					layout_data = {
+						'window': window,
+						'parent_hwnd': window._hwnd,
+					}
+					window._handle_resize(		# -- FIXME : i think this one is redundant
+						win32api.LOWORD(lparam),
+						win32api.HIWORD(lparam),
+						layout_data
+					)
 					return 0
 				elif msg == win32con.WM_PAINT:
+					# Always validate paint region to prevent endless WM_PAINT messages
 					try:
-						win32gui.ValidateRect(hwnd, None)
+						ps = PAINTSTRUCT()
+						hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
+						if hdc:
+							update_rect = (ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom)
+							print(f"Update region: {update_rect}")
+							user32.EndPaint(hwnd, ctypes.byref(ps))
 					except Exception as e:
 						print(f"Paint error: {e}")
 					return 0
-				else:
-					return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
-			except Exception as e:
-				print(f"Window procedure error: {e}")
-				return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
-		
-		# Store the window procedure to prevent garbage collection
-		Win32Window._window_proc = window_proc
-		
+				elif msg == win32con.WM_CTLCOLORSTATIC:
+					# Default handling for static controls without custom handlers
+					default_color = Win32Color.black.value
+					win32gui.SetTextColor(wparam, default_color)
+					win32gui.SetBkMode(wparam, win32con.TRANSPARENT)
+					return win32gui.GetStockObject(win32con.WHITE_BRUSH)
+			except (RuntimeError, WindowsError) as e:
+				# Window instance not found - this shouldn't happen except during WM_CREATE
+				print(f"Warning: Could not get window instance ({msg=}): {e}")
+
+			# Fall back to default processing for unhandled messages
+			return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+		except Exception as e:
+			print(f"Window procedure error: {e}")
+			return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+	@classmethod
+	def _register_window_class(cls):
+		"""Register the window class for Win32Window instances."""
 		# Create and register the window class
 		wc = WNDCLASSEX()
 		wc.cbSize = ctypes.sizeof(WNDCLASSEX)
 		wc.style = win32con.CS_HREDRAW | win32con.CS_VREDRAW
-		wc.lpfnWndProc = window_proc
+		wc.lpfnWndProc = cls._window_proc  # Use our class method directly
 		wc.cbClsExtra = 0
-		wc.cbWndExtra = 0
+		wc.cbWndExtra = 0  # No extra bytes needed - using instance map instead
 		wc.hInstance = win32api.GetModuleHandle(None)
 		wc.hIcon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
 		wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
 		wc.hbrBackground = win32gui.GetStockObject(win32con.WHITE_BRUSH)
 		wc.lpszMenuName = None
-		wc.lpszClassName = Win32Window._window_class_name
+		wc.lpszClassName = cls._window_class_name
 		wc.hIconSm = 0
 		
 		try:
@@ -486,19 +1198,12 @@ class Win32Window(LayoutWindow):
 					-rect.left, -rect.top, rect.right - rect.left, rect.bottom - rect.top )
 		return metrics
 
-	def query_width_request(self):
-		# Query the width requirements of the child layout
+	def query_axis_request(self, axis):
+		# Query the width/height requirements of the child layout
 		metrics = self._get_window_border_metrics()
 		# Calculate horizontal padding
-		request_width = self.child.query_width_request() if self.child else 1
-		return request_width + metrics[2]
-
-	def query_height_request(self):
-		# Query the width requirements of the child layout
-		metrics = self._get_window_border_metrics()
-		# Calculate horizontal padding
-		request_height = self.child.query_height_request() if self.child else 1
-		return request_height + metrics[3]
+		request_size = self.child.query_axis_request(axis) if self.child else 1
+		return request_size + metrics[axis+2]
 	
 	def distribute_width(self, available_width: int) -> int:
 		metrics = self._get_window_border_metrics()
@@ -521,9 +1226,8 @@ class Win32Window(LayoutWindow):
 
 	def position_at(self, x: int, y: int, data=None) -> None:
 		"""Position this window and its child widgets at the specified coordinates."""
-		using_client_origin = self.client_origin
-		if data is not None and 'client_origin' in data:
-			using_client_origin = data['client_origin']
+		assert data is not None, "Data must be provided for positioning"
+		using_client_origin = data.get('client_origin', self.client_origin)
 		
 		# First store our position for layout calculations
 		if using_client_origin:
@@ -552,7 +1256,7 @@ class Win32Window(LayoutWindow):
 		# The child is positioned relative to the client area (0,0)
 		if self.child:
 			assert self._hwnd is not None, "Window handle required for positioning"
-			self.child.position_at(0, 0, {'parent_hwnd': self._hwnd})
+			self.child.position_at(0, 0, {**data, 'parent_hwnd': self._hwnd})
 	
 	# ---
 	
@@ -586,14 +1290,15 @@ class Win32Window(LayoutWindow):
 			print(f"Using specified width: {actual_width}")
 			if metrics:
 				actual_width += metrics[2]  # Add border width for client area sizing
-				print(f"Adjusted for borders: {actual_width}")
+				print(f"  Adjusted for borders: {actual_width}")
 		else:
 			# Calculate from layout
 			requested_width = self.query_width_request()
 			print(f"Layout requested width: {requested_width}")
 			if metrics:
 				requested_width += metrics[2]
-			actual_width = int(self.distribute_width(requested_width))
+				print(f"  Adjusted for borders: {requested_width}")
+			actual_width = math.ceil(self.distribute_width(requested_width))
 		
 		# Handle height
 		if self.initial_size[1] is not None:
@@ -602,13 +1307,14 @@ class Win32Window(LayoutWindow):
 			print(f"Using specified height: {actual_height}")
 			if metrics:
 				actual_height += metrics[3]  # Add border height for client area sizing
-				print(f"Adjusted for borders: {actual_height}")
+				print(f"  Adjusted for borders: {actual_height}")
 		else:
 			# Calculate from layout
 			requested_height = self.query_height_request()
 			print(f"Layout requested height: {requested_height}")
 			if metrics:
 				requested_height += metrics[3]
+				print(f"  Adjusted for borders: {requested_height}")
 			actual_height = int(self.distribute_height(requested_height))
 		
 		print(f"Final window size will be: {actual_width}x{actual_height}")
@@ -628,6 +1334,9 @@ class Win32Window(LayoutWindow):
 			# Create proper HANDLE for instance
 			hinstance = wintypes.HINSTANCE(hinstance)
 			
+			# Create a py_object to pass ourselves to the window procedure
+			self._create_param = ctypes.py_object(self)
+			
 			hwnd = user32.CreateWindowExW(
 				wintypes.DWORD(self._window_style_ex),  # Extended style
 				lp_class_name,
@@ -640,29 +1349,36 @@ class Win32Window(LayoutWindow):
 				wintypes.HWND(None),  # No parent window
 				wintypes.HMENU(None),  # No menu
 				hinstance,
-				None  # No window creation data
+				ctypes.cast(ctypes.pointer(self._create_param), ctypes.c_void_p)  # Pass our instance
 			)
 			
 			if not hwnd:
 				err = ctypes.get_last_error()
 				raise ctypes.WinError(err)
 			
+			# Ensure that _window_map was set by window creation
+			assert Win32Window._window_map.get(hwnd) == self
+			
 			self._hwnd = hwnd
 			print(f"Window created successfully (hwnd: {hwnd})")
 			
-			# Set window visibility
+			# Skip the explicit layout if we already got one from WM_SIZE
+			if not self._initial_layout_done:
+				# Compute desired position/size from window rect
+				client_rect = win32gui.GetClientRect(hwnd)
+				width = client_rect[2] - client_rect[0]
+				height = client_rect[3] - client_rect[1]
+				# Create layout data that will be inherited by all child widgets
+				layout_data = {
+					'parent_hwnd': self._hwnd,
+					'window': self
+				}
+				# Do initial layout using the same handler as resize
+				self._handle_resize(width, height, layout_data)
+			
+			# Show the window once layout is complete
 			user32.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
 			user32.UpdateWindow(hwnd)
-			
-			rect = win32gui.GetWindowRect(hwnd)
-			# Do initial layout and position all widgets
-			client_rect = win32gui.GetClientRect(hwnd)
-			width = client_rect[2] - client_rect[0]
-			height = client_rect[3] - client_rect[1]
-			self.layout(0, 0, width, height, {'parent_hwnd': self._hwnd})
-			
-			# Position the window itself at its current screen coordinates
-			self.position_at(rect[0], rect[1], {'client_origin': False, 'parent_hwnd': self._hwnd})
 			
 			return hwnd
 			
@@ -672,20 +1388,54 @@ class Win32Window(LayoutWindow):
 				print(f"Win32 error code: {e.winerror}")
 			raise
 	
-	def _handle_resize(self, width, height):
+	def handle_message(self, hwnd: int, msg: int, wparam: int, lparam: int) -> int | None:
+		"""Handle a window message.
+		
+		Args:
+			hwnd: Window handle message was sent to
+			msg: Message identifier
+			wparam: First message parameter
+			lparam: Second message parameter
+			
+		Returns:
+			int if message was handled, None to allow default processing
+		"""
+		if msg == win32con.WM_SIZE:
+			width = win32api.LOWORD(lparam)
+			height = win32api.HIWORD(lparam)
+			# Handle resize with fresh layout data
+			layout_data = {
+				'window': self,
+				'parent_hwnd': hwnd  # self._hwnd won't be set yet during creation
+			}
+			self._handle_resize(width, height, layout_data)
+			return 0
+		return None
+
+	def _handle_resize(self, width, height, data):
 		"""Handle window resize by updating the child layout."""
 		# width and height are client area dimensions
 		if self.child:
-			self.child.layout(0, 0, width, height, {'parent_hwnd': self._hwnd})
+			self.child.layout(0, 0, width, height, data)
+			# First successful layout marks initialization complete
+			if not self._initial_layout_done:
+				self._initial_layout_done = True
 	
-	def _update_layout(self, actual_size):
+	def _update_layout(self, actual_size, data):
 		"""Update the layout if size has changed."""
 		if self._hwnd is None or tuple(self._computed_size) == tuple(actual_size):
 			return
 		
 		# Perform layout
 		if actual_size:
-			self.layout(0, 0, actual_size[0], actual_size[1], {'parent_hwnd': self._hwnd})
+			# Update layout data with current window state
+			layout_data = {
+				**data,
+				'parent_hwnd': self._hwnd,
+				'window': self,
+				'initial_layout': False
+			}
+			self.layout(0, 0, actual_size[0], actual_size[1], layout_data)
 	
 	def show(self):
 		"""Show the window."""
@@ -718,7 +1468,9 @@ def build_horizontal_line_demo():
 			Win32Container.vertical(
 				gap=5,
 				children=(
-					Win32Text("Demo 1: Full-width horizontal line"),
+					Win32Text("Demo 1: Full-width horizontal line",
+							 font=Win32Font.create("Verdana", size=14, bold=True),
+							 color=Win32Color.from_name('royalblue')),  # Using custom font and color
 					Win32SeparatorLine(),  # Should stretch across entire window width
 				)
 			),
@@ -744,10 +1496,19 @@ def build_horizontal_line_demo():
 			Win32Container.vertical(
 				gap=5,
 				children=(
-					Win32Text("Demo 3: Horizontal line with padding"),
+					Win32Text("Demo 3: Horizontal line with padding (inset from edges)"),
 					Win32Padding(20,  # 20px padding on all sides
 						Win32SeparatorLine()
 					),
+				)
+			),
+			
+			# Demo 4: Horizontal line with constrained width
+			Win32Container.vertical(
+				gap=5,
+				children=(
+					Win32Text("Demo 4: Horizontal line with constrained width"),
+					Win32SeparatorLine(width=300),  # Fixed width of 300px
 				)
 			),
 		)
@@ -755,7 +1516,7 @@ def build_horizontal_line_demo():
 
 
 def run_demo():
-	# layout_content = LayoutWindow(child=build_horizontal_line_demo())
+	# Build demo layout
 	layout_content = build_horizontal_line_demo()
 
 	try:
@@ -763,8 +1524,8 @@ def run_demo():
 		print("Creating window with specified size 800x600")
 		window = Win32Window(
 			title="Test Window",
-			width=800,
-			height=600,
+			width=None, # 800,
+			height=200,
 			child=layout_content
 		)
 		

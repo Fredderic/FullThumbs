@@ -12,9 +12,12 @@ from src.window_layout import (
 	Dimension, Fixed, Expand, Grow,
 	Layout, LayoutSpacer, LayoutText, LayoutButton, LayoutEdit,
 	LayoutContainer, LayoutPadding, LayoutWindow, LayoutGroup,
-	LayoutLink, LayoutSeparatorLine,
+	LayoutLink, LayoutSeparatorLine, LayoutPluginContext, layout_context_class,
 	build_about_dialog
 )
+
+
+layout_context_class(LayoutPluginContext)
 
 
 class TestSizeQueryMethods(unittest.TestCase):

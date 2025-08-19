@@ -16,14 +16,17 @@ sys.path.insert(0, project_root)
 sys.path.insert(0, os.path.join(project_root, 'src'))
 
 import window_layout
-from window_layout import (LayoutText, LayoutButton, LayoutContainer, Expand,
-                         LayoutPluginContext, layout_context)
+from window_layout import (
+    LayoutText,
+    LayoutButton,
+    LayoutContainer,
+    Expand,
+    LayoutPluginContext,
+    layout_context_class
+)
 
 
-@layout_context
-class TestContext(LayoutPluginContext):
-    """Test context that uses the default measurement implementation."""
-    pass
+layout_context_class(LayoutPluginContext)
 
 
 class TestIntelligentTextWrapping(unittest.TestCase):
@@ -191,11 +194,12 @@ class TestTextWrappingLayoutIntegration(unittest.TestCase):
         small_width = 200
         actual = layout.distribute_width(small_width)
         
-        # Should expand beyond target due to unwrappable text
-        self.assertGreater(actual, small_width)
+        # Layout should respect the constraint and use exactly available space
+        self.assertEqual(actual, small_width)
         
-        # But should still be a reasonable result
-        self.assertLess(actual, small_width * 3)  # Not excessively large
+        # TODO: Add development-time warnings when text gets clipped
+        # This would help catch layout issues during development while still
+        # maintaining stable runtime layout behavior
 
 
 class TestWordBoundaryRespect(unittest.TestCase):

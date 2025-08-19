@@ -17,24 +17,20 @@ sys.path.insert(0, project_root)
 sys.path.insert(0, os.path.join(project_root, 'src'))
 
 from functools import lru_cache
-from window_layout import (LayoutText, LayoutPluginContext, _layout_context, 
-                         layout_context)
+from window_layout import LayoutText, LayoutPluginContext, layout_context, layout_context_class
 from typing import cast
 
-@layout_context
-class TestContext(LayoutPluginContext):
-    """Test context that uses the default measurement implementation."""
-    pass
+layout_context_class(LayoutPluginContext)
 
 class TestDefaultTextMeasurement(unittest.TestCase):
     """Test the default text measurement approximations using the global context."""
     
     def setUp(self):
-        """Verify the global context is available."""
-        assert _layout_context is not None, "Global layout context not initialized"
-        # Tell type checker this is definitely a LayoutPluginContext
-        self.context = cast(LayoutPluginContext, _layout_context)
-        
+        """Verify the global context is available and get the current context."""
+        # Only test _layout_context directly in one place since we're testing the plugin system
+        self.context = layout_context()
+        assert self.context is not None, "Global layout context not initialized"
+
     def tearDown(self):
         """Clean up after each test."""
         self.context = None
