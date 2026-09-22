@@ -36,6 +36,27 @@ def get_inner_client_rect(hwnd):
 		dest_right - PIP_PADDING,	dest_bottom - PIP_PADDING
 	)
 
+# --- Mouse leave tracking (WM_MOUSELEAVE only fires once TrackMouseEvent has armed it)
+
+class _TRACKMOUSEEVENT(ctypes.Structure):
+	_fields_ = [
+		("cbSize", ctypes.c_uint),
+		("dwFlags", ctypes.c_uint),
+		("hwndTrack", ctypes.c_void_p),
+		("dwHoverTime", ctypes.c_uint),
+	]
+
+TME_LEAVE = 0x00000002
+
+def track_mouse_leave(hwnd):
+	"""Arm a one-shot WM_MOUSELEAVE for hwnd; call again on every WM_MOUSEMOVE to keep it armed."""
+	tme = _TRACKMOUSEEVENT()
+	tme.cbSize = ctypes.sizeof(_TRACKMOUSEEVENT)
+	tme.dwFlags = TME_LEAVE
+	tme.hwndTrack = hwnd
+	tme.dwHoverTime = 0
+	ctypes.windll.user32.TrackMouseEvent(ctypes.byref(tme))
+
 # --- Timer class to manage application timers
 
 class Timer(NamedTuple):

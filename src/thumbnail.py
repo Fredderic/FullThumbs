@@ -134,7 +134,14 @@ class ThumbnailManager:
 			dwmapi_lib.DwmUnregisterThumbnail(self.thumb_handle)
 			self.thumb_handle = None
 			self.is_valid = False  # Mark as invalid but keep current_thumb_rect
-	
+
+	def switch_source(self, source_hwnd):
+		"""Re-target this slot to show a different source window, keeping the same target/rect."""
+		self.cleanup_thumbnail()
+		self.source_hwnd = source_hwnd
+		self.is_valid = True
+		self.register_thumbnail()
+
 	def check_within_thumbnail_rect(self, x, y):
 		"""Check if coordinates are within thumbnail rectangle."""
 		if self.current_thumb_rect:

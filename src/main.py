@@ -4,9 +4,8 @@ from win32api import GetSystemMetrics
 from .constants import DEBUG_PY, SETTINGS_FILE, WINDOW_MODE_NORMAL
 from .settings import load_window_placement, save_window_placement
 from .win_api import Timer, get_inner_client_rect
-from .window_main import TIMER_CHECK_SOURCE, TIMER_UPDATE_CHECK, create_pip_window, get_default_window_area
+from .window_main import TIMER_CHECK_SOURCE, TIMER_UPDATE_CHECK, create_pip_window, get_default_window_area, handle_source_window_status
 from .window_finder import window_finder_by_regex
-from .thumbnail import ThumbnailManager
 
 # -------
 
@@ -14,33 +13,27 @@ from .thumbnail import ThumbnailManager
 # g_dwmapi_lib = ctypes.windll.dwmapi		# dwmapi library handle
 
 g_exit_code = 0 # Global exit code for the application
-g_target_app_match = None # Function to find the target application window
+g_target_app_matches = [] # Ordered list of finder functions; first non-topmost match is shown
 g_current_window_mode = WINDOW_MODE_NORMAL # Current window mode
 
 g_pip_hwnd = None # Global handle for the PiP window
-g_source_hwnd = None
-g_thumbnail = None
+g_thumbnail_slots = {} # finder-index -> ThumbnailManager, for each currently matched window
 g_update_interval = 0  # Auto-update check interval
 g_debug_simulate_update = False  # Debug flag to simulate update restart
 
 
 def setup(update_interval_ms=0, debug_simulate_update=False):
-	global g_target_app_match, g_source_hwnd, g_pip_hwnd, g_current_thumb_rect_in_pip
-	global g_current_window_mode, g_thumbnail, g_update_interval, g_debug_simulate_update
+	global g_target_app_matches, g_pip_hwnd, g_current_thumb_rect_in_pip
+	global g_current_window_mode, g_update_interval, g_debug_simulate_update
 	
 	g_update_interval = update_interval_ms
 	g_debug_simulate_update = debug_simulate_update
 
-	# target_app_title = "Sky"
-	g_target_app_match = window_finder_by_regex(r'^Sky$', 'TgcMainWindow')
-
-	print(f"Attempting to find application...")
-	g_source_hwnd = g_target_app_match()
-
-	if not g_source_hwnd:
-		print(f"Could not find target application. Make sure it's running.")
-	else:
-		print(f"Found window '{win32gui.GetWindowText(g_source_hwnd)}' with HWND: {g_source_hwnd}")
+	# List of windows to watch; each gets its own thumbnail slot, shown simultaneously.
+	g_target_app_matches = [
+		window_finder_by_regex(r'^Sky$', 'TgcMainWindow'),
+		window_finder_by_regex(r'^Mabinogi$', 'Mabinogi'),
+	]
 
 	# Define PiP window size and position (e.g., bottom right of main monitor)
 	if (settings := load_window_placement(SETTINGS_FILE)):
@@ -70,20 +63,15 @@ def setup(update_interval_ms=0, debug_simulate_update=False):
 	g_current_thumb_rect_in_pip = pip_rect = get_inner_client_rect(g_pip_hwnd)
 	print(f"PiP client area: {pip_rect}")
 
-	if g_source_hwnd is not None:
-		try:
-			g_thumbnail = ThumbnailManager(g_pip_hwnd, pip_rect, g_source_hwnd)
-		except Exception as e:
-			print("Failed to get DWM thumbnail. The target application might be in true exclusive fullscreen mode.")
-			win32gui.DestroyWindow(g_pip_hwnd) # Clean up PiP window
-			exit(1)
+	print(f"Attempting to find application(s)...")
+	handle_source_window_status(g_pip_hwnd) # Populate/layout initial thumbnail slot(s), if any are found
 
-	print("DWM thumbnail successfully registered. The PiP window should now show the live view.")
-	print("Click the PiP window to bring the source app to front.")
+	print("Click a thumbnail to bring its source app to front.")
 	print("Right-click to close the PiP window and clean up.")
 
-	# Set a timer to periodically check the source window
+	# Set a timer to periodically check the source window(s)
 	TIMER_CHECK_SOURCE.start(g_pip_hwnd) # Start the timer
+	# g_window_test_marker.start(g_pip_hwnd) # TEMP TEST: disabled now the border colour conveys on-top state
 	
 	# Set update check timer if auto-updates are enabled
 	if g_update_interval > 0:
@@ -105,8 +93,9 @@ def run():
 		return 1  # Exit with error code for unexpected exceptions
 	finally:
 		print("Cleaning up...")
-		if g_thumbnail:
-			g_thumbnail.cleanup_thumbnail()
+		for thumb in g_thumbnail_slots.values():
+			thumb.cleanup_thumbnail()
+		g_thumbnail_slots.clear()
 		if g_pip_hwnd: # Stop the timer
 			Timer.stop_all(g_pip_hwnd) # Stop all timers
 			save_window_placement(g_pip_hwnd) # Save the current position

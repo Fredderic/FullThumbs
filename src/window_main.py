@@ -2,10 +2,12 @@
 Handles the main window creation and management for the FullThumbs application.
 """
 
+from types import SimpleNamespace
+
 import win32gui, win32con, win32api
 
 from .constants import PIP_PADDING, WINDOW_MODE_MINIMAL, WINDOW_MODE_MINIMAL_TEXT, WINDOW_MODE_NORMAL, WINDOW_MODE_NORMAL_TEXT, WINDOW_MODE_TOPMOST, WINDOW_MODE_TOPMOST_TEXT
-from .win_api import Timer, split_lparam_pos, get_inner_client_rect
+from .win_api import Timer, split_lparam_pos, get_inner_client_rect, track_mouse_leave
 from .window_styles import get_window_style_flags
 from .settings import save_window_placement
 
@@ -91,6 +93,25 @@ def get_default_window_area():
 
 # -------
 
+COLORS = SimpleNamespace(
+	RED			= win32api.RGB(255, 0, 0),
+	BLUE		= win32api.RGB(0, 0, 255),
+	WHITE		= win32api.RGB(255, 255, 255),
+	DARK_GREY	= win32api.RGB(60, 60, 60),
+	BLACK		= win32api.RGB(0, 0, 0)
+)
+
+THEME = SimpleNamespace(
+	BACKGROUND	= COLORS.DARK_GREY,
+	TEXT		= COLORS.WHITE,
+	LINK		= COLORS.BLUE,
+	TMB_MARKER	= COLORS.BLACK,
+	TMB_HOVER	= COLORS.RED,
+	TMB_ON_TOP	= COLORS.BLUE,
+)
+
+# -------
+
 # Menu IDs
 MENU_ID_EXIT = 1001
 MENU_ID_ABOUT = 1002
@@ -105,11 +126,23 @@ TIMER_CHECK_SOURCE = Timer(id=2001, ms=200)  # Check source window every 200 ms
 TIMER_SAVE_WIN_POS = Timer(id=2002, ms=1000) # Save window position every second
 TIMER_UPDATE_CHECK = Timer(id=2003, ms=None) # Update check timer with configurable interval
 
+_context_menu_target_hwnd = None # Source hwnd of the thumbnail under the cursor at last right-click
+
 def present_context_menu(hwnd, screen_x, screen_y):
 	"""Present context menu at specified screen coordinates."""
+	global _context_menu_target_hwnd
 
-	from src.main import g_current_window_mode, g_source_hwnd, g_update_interval
+	from src.main import g_current_window_mode, g_thumbnail_slots # FIXME: , g_update_interval
 	from src.constants import DEBUG_PY
+
+	client_x, client_y = win32gui.ScreenToClient(hwnd, (screen_x, screen_y))
+	target_thumb = find_thumbnail_at(g_thumbnail_slots, client_x, client_y)
+	_context_menu_target_hwnd = target_thumb.source_hwnd if target_thumb else None
+	# NOTE: not using set_hovered_thumb() here -- the popup can cause a spurious WM_MOUSELEAVE,
+	# so the border colour check in WM_PAINT also checks _context_menu_target_hwnd directly.
+	if target_thumb and target_thumb is not _hovered_thumb and target_thumb.current_thumb_rect:
+		left, top, right, bottom = target_thumb.current_thumb_rect
+		win32gui.InvalidateRect(hwnd, (left-2, top-2, right+2, bottom+2), False)
 
 	hmenu = win32gui.CreatePopupMenu()
 
@@ -141,17 +174,32 @@ def present_context_menu(hwnd, screen_x, screen_y):
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_ABOUT, "About...")
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_EXIT, "Exit PiP")
 
-	# Disable "Bring Source App to Front" if no source window is available
-	if g_source_hwnd is None:
+	# Disable "Bring Source App to Front" if no thumbnail was under the cursor
+	if _context_menu_target_hwnd is None:
 		win32gui.EnableMenuItem(hmenu, MENU_ID_APP_TO_FRONT, win32con.MF_GRAYED)
 
-	# Display the context menu
-	result = win32gui.TrackPopupMenu(hmenu,
-		win32con.TPM_LEFTALIGN | win32con.TPM_RIGHTBUTTON,
+	# Use TPM_RETURNCMD so the selection is available synchronously here -- without it,
+	# TrackPopupMenu *posts* WM_COMMAND, which would arrive after we clear the target below.
+	cmd_id = win32gui.TrackPopupMenu(hmenu,
+		win32con.TPM_LEFTALIGN | win32con.TPM_RIGHTBUTTON | win32con.TPM_RETURNCMD,
 		screen_x, screen_y, 0, hwnd, None
 	)
-	print(f"Context menu command selected: {result}")
+	print(f"Context menu command selected: {cmd_id}")
 	win32gui.DestroyMenu(hmenu) # Clean up the menu after use
+
+	if cmd_id:
+		win32gui.SendMessage(hwnd, win32con.WM_COMMAND, win32api.MAKELONG(cmd_id, 0), 0)
+
+	_context_menu_target_hwnd = None
+	if target_thumb and target_thumb is not _hovered_thumb and target_thumb.current_thumb_rect:
+		# Clear the sticky highlight (no-op if the mouse is now genuinely hovering it)
+		left, top, right, bottom = target_thumb.current_thumb_rect
+		win32gui.InvalidateRect(hwnd, (left-2, top-2, right+2, bottom+2), False)
+
+	# The menu blocked the message loop; refresh hover now the mouse may have moved on
+	cursor_x, cursor_y = win32gui.ScreenToClient(hwnd, win32gui.GetCursorPos())
+	set_hovered_thumb(hwnd, find_thumbnail_at(g_thumbnail_slots, cursor_x, cursor_y))
+
 	return True # Indicate the menu was presented
 
 # -------
@@ -263,7 +311,7 @@ def show_about_dialog(parent_hwnd, about_text):
 			# Color the GitHub link blue
 			if lparam == link_hwnd:
 				hdc = wparam
-				win32gui.SetTextColor(hdc, win32api.RGB(0, 0, 255))  # Blue text
+				win32gui.SetTextColor(hdc, THEME.LINK)
 				win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
 				# Return the dialog background brush
 				return win32gui.GetSysColorBrush(win32con.COLOR_BTNFACE)
@@ -518,14 +566,14 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 				return default_result
 			
 			# For client area, check if we should customize behavior
-			if main.g_thumbnail and default_result == win32con.HTCLIENT:
+			if main.g_thumbnail_slots and default_result == win32con.HTCLIENT:
 				screen_x, screen_y = win32gui.ScreenToClient(hwnd, split_lparam_pos(lparam))
 				
-				# If mouse is over the thumbnail area, pass through clicks
-				if main.g_thumbnail.check_within_thumbnail_rect(screen_x, screen_y):
+				# If mouse is over a thumbnail's area, pass through clicks
+				if find_thumbnail_at(main.g_thumbnail_slots, screen_x, screen_y):
 					return win32con.HTCLIENT
 				
-				# If mouse is in the gap area around the thumbnail, enable dragging
+				# If mouse is in the gap area around the thumbnails, enable dragging
 				return win32con.HTCAPTION
 			
 			# For all other areas (title bar, etc.), use default behavior
@@ -538,15 +586,31 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 				return 0	# indicate we handled the message
 				# NOTE: fallthrough would set default cursor
 
+		elif msg == win32con.WM_MOUSEMOVE:
+			track_mouse_leave(hwnd) # Re-arm WM_MOUSELEAVE; it's one-shot
+			mouse_x, mouse_y = split_lparam_pos(lparam)
+			set_hovered_thumb(hwnd, find_thumbnail_at(main.g_thumbnail_slots, mouse_x, mouse_y))
+			# NOTE: fall through for default processing
+
+		elif msg == win32con.WM_MOUSELEAVE:
+			set_hovered_thumb(hwnd, None)
+			return 0
+
 		elif msg == win32con.WM_TIMER:
 			# Handle periodic checks for the source window
 			if wparam == TIMER_CHECK_SOURCE.id:
 				handle_source_window_status(hwnd)
+				refresh_on_top_highlights(hwnd)
 				return 0 # indicate we handled the message
 			elif wparam == TIMER_SAVE_WIN_POS.id:
 				# Save the current position of the PiP window
 				save_window_placement(hwnd)
+				TIMER_SAVE_WIN_POS.stop() # One-shot: only restarted by WM_MOVE/WM_SIZE
 				return 0 # indicate we handled the message
+			# elif wparam == WindowTestMarker.TIMER.id:
+			# 	# TEMP TEST: disabled now the border colour conveys on-top state
+			# 	g_window_test_marker.check(hwnd)
+			# 	return 0
 			elif wparam == TIMER_UPDATE_CHECK.id:
 				# Check for git updates if enabled
 				from . import main
@@ -566,31 +630,43 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 			hdc, ps = win32gui.BeginPaint(hwnd) # Get DC for painting
 
 			# 1. Draw the background of the PiP window
-			background_color = win32api.RGB(60, 60, 60) # Dark gray background
+			background_color = THEME.BACKGROUND
 			client_rect = win32gui.GetClientRect(hwnd)
 			fill_brush = win32gui.CreateSolidBrush(background_color) # Dark gray background
 			win32gui.FillRect(hdc, client_rect, fill_brush)
 			win32gui.DeleteObject(fill_brush)
 
-			if main.g_thumbnail:
-				# Create red pen and null brush for drawing
-				red_pen = win32gui.CreatePen(win32con.PS_SOLID, 2, win32api.RGB(255, 0, 0)) # 2 pixels thick
-				old_pen = win32gui.SelectObject(hdc, red_pen)
+			if main.g_thumbnail_slots:
 				null_brush = win32gui.GetStockObject(win32con.NULL_BRUSH)
 				old_brush = win32gui.SelectObject(hdc, null_brush)
 
-				# Get the rect from the thumbnail manager
-				box_left, box_top, box_right, box_bottom = main.g_thumbnail.current_thumb_rect
-				
-				# Draw the rectangle
-				win32gui.Rectangle(hdc, box_left-1, box_top-1, box_right+2, box_bottom+2)
+				# Draw a box (and cross, if invalid) for each active thumbnail slot
+				for thumb in main.g_thumbnail_slots.values():
+					if not thumb.current_thumb_rect:
+						continue # Registration failed before a rect could be computed (e.g. fullscreen source)
+					box_left, box_top, box_right, box_bottom = thumb.current_thumb_rect
 
-				# If the thumbnail is invalid, draw the cross
-				if not main.g_thumbnail.is_valid:
-					win32gui.MoveToEx(hdc, box_left, box_top)
-					win32gui.LineTo(hdc, box_right, box_bottom)
-					win32gui.MoveToEx(hdc, box_left, box_bottom)
-					win32gui.LineTo(hdc, box_right, box_top)
+					# Hover/menu highlight takes precedence over the on-top indicator
+					if thumb is _hovered_thumb or thumb.source_hwnd == _context_menu_target_hwnd:
+						border_color = THEME.TMB_HOVER
+					elif is_window_on_top(thumb.source_hwnd):
+						border_color = THEME.TMB_ON_TOP
+					else:
+						border_color = THEME.TMB_MARKER
+
+					marker_pen = win32gui.CreatePen(win32con.PS_SOLID, 2, border_color)
+					old_pen = win32gui.SelectObject(hdc, marker_pen)
+
+					win32gui.Rectangle(hdc, box_left-1, box_top-1, box_right+2, box_bottom+2)
+
+					if not thumb.is_valid:
+						win32gui.MoveToEx(hdc, box_left, box_top)
+						win32gui.LineTo(hdc, box_right, box_bottom)
+						win32gui.MoveToEx(hdc, box_left, box_bottom)
+						win32gui.LineTo(hdc, box_right, box_top)
+
+					win32gui.SelectObject(hdc, old_pen)
+					win32gui.DeleteObject(marker_pen)
 
 			else:
 				# No thumbnail yet - use default area
@@ -599,8 +675,8 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 				box_bottom = box_top + height
 
 				# Create red pen and null brush for drawing
-				red_pen = win32gui.CreatePen(win32con.PS_SOLID, 2, win32api.RGB(255, 0, 0))
-				old_pen = win32gui.SelectObject(hdc, red_pen)
+				marker_pen = win32gui.CreatePen(win32con.PS_SOLID, 2, THEME.TMB_MARKER)
+				old_pen = win32gui.SelectObject(hdc, marker_pen)
 				null_brush = win32gui.GetStockObject(win32con.NULL_BRUSH)
 				old_brush = win32gui.SelectObject(hdc, null_brush)
 
@@ -611,8 +687,11 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 				win32gui.MoveToEx(hdc, box_left, box_bottom)
 				win32gui.LineTo(hdc, box_right, box_top)
 
+				win32gui.SelectObject(hdc, old_pen)
+				win32gui.DeleteObject(marker_pen)
+
 			# 	message = "Not Found"		-- TODO
-			# 	text_color = win32api.RGB(255, 255, 255)
+			# 	text_color = THEME.TEXT
 			# 	win32gui.SetTextColor(hdc, text_color)
 			# 	win32gui.SetBkMode(hdc, win32con.TRANSPARENT) # Transparent background
 			# 	# Draw the text in the center of the PiP window
@@ -624,11 +703,9 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 			# 	win32gui.TextOut(hdc, text_x, text_y, message)
 
 			# Restore original GDI objects
-			win32gui.SelectObject(hdc, old_pen)
-			win32gui.DeleteObject(red_pen)
 			win32gui.SelectObject(hdc, old_brush) # NULL_BRUSH doesn't need deleting
 
-			print(f"Drawing thumbnail box at: {box_left}, {box_top}, {box_right}, {box_bottom}")
+			# g_window_test_marker.draw(hdc) # TEMP TEST: disabled now the border colour conveys on-top state
 
 			# NOTE: DWM thumbnails are rendered *on top* of anything you draw.
 			# So, drawing a background or border *first* is correct.
@@ -643,14 +720,8 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 			new_client_width, new_client_height = split_lparam_pos(lparam)
 			print(f"PiP window resized to client dimensions: {new_client_width}x{new_client_height}")
 
-			if main.g_thumbnail:
-				# Recalculate thumbnail's destination rectangle based on new client size
-				thumb_draw_top = PIP_PADDING
-				thumb_draw_left = PIP_PADDING
-				thumb_draw_right = max(PIP_PADDING, new_client_width - PIP_PADDING)
-				thumb_draw_bottom = max(PIP_PADDING, new_client_height - PIP_PADDING)
-				thumb_draw_rect = (thumb_draw_left, thumb_draw_top, thumb_draw_right, thumb_draw_bottom)
-				main.g_thumbnail.update_thumbnail_rect(thumb_draw_rect)
+			if main.g_thumbnail_slots:
+				layout_thumbnails(hwnd)
 
 			TIMER_SAVE_WIN_POS.start(hwnd) # Restart the timer to save window position
 			return 0	# do not call DefWindowProc
@@ -666,17 +737,17 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 
 		elif msg == win32con.WM_LBUTTONDOWN:
 			click_x, click_y = split_lparam_pos(lparam)
-			if check_within_pip_rect(click_x, click_y):
-				# Left-click to bring the source app to front
-				bring_window_to_front(main.g_source_hwnd)
+			target_thumb = find_thumbnail_at(main.g_thumbnail_slots, click_x, click_y)
+			if target_thumb:
+				# Left-click to bring that thumbnail's source app to front
+				bring_window_to_front(target_thumb.source_hwnd)
 			# NOTE: fall through for default processing
 
 		elif msg == win32con.WM_RBUTTONDOWN:
-			# Right-click to close the PiP window
-			screen_x, screen_y = win32gui.ClientToScreen(hwnd, split_lparam_pos(lparam))
-			print(f"Right-click at screen coordinates: {screen_x}, {screen_y}")
-			present_context_menu(hwnd, screen_x, screen_y)
-			# NOTE: fall through for default processing
+			# Just let this fall through to DefWindowProc, which raises WM_CONTEXTMENU on button-up
+			# (handling it here too would show the popup menu twice for a single right-click)
+			pass
+
 		elif msg == win32con.WM_CONTEXTMENU:
 			# Get mouse coordinates in screen coordinates for TrackPopupMenuEx
 			if lparam == -1: # screen_x == 65535 and screen_y == 65535:
@@ -718,9 +789,9 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 				check_for_git_updates()
 				return 0
 			elif cmd_id == MENU_ID_APP_TO_FRONT:
-				# Bring the source application to the front
-				if main.g_source_hwnd:
-					bring_window_to_front(main.g_source_hwnd)
+				# Bring the thumbnail's source application (under the cursor at right-click) to the front
+				if _context_menu_target_hwnd:
+					bring_window_to_front(_context_menu_target_hwnd)
 				else:
 					win32gui.MessageBox(hwnd, "No source application found.", "Error", win32con.MB_OK | win32con.MB_ICONERROR)
 				return 0
@@ -814,38 +885,140 @@ def bring_window_to_front(hwnd):
 	if win32gui.IsIconic(hwnd):
 		win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
 
-def handle_source_window_status(hwnd):
-	# global g_source_hwnd
+def is_window_on_top(hwnd):
+	"""Check if hwnd is the active foreground window and not minimized."""
+	return bool(hwnd) and win32gui.GetForegroundWindow() == hwnd and not win32gui.IsIconic(hwnd)
+
+def find_thumbnail_at(slots, x, y):
+	"""Return the ThumbnailManager (from a slot dict) whose rect contains (x, y), or None."""
+	for thumb in slots.values():
+		if thumb.check_within_thumbnail_rect(x, y):
+			return thumb
+	return None
+
+_hovered_thumb = None # Thumbnail currently highlighted for mouseover/context-menu, if any
+
+def set_hovered_thumb(hwnd, thumb):
+	"""Update which thumbnail is mouseover-highlighted, repainting only what changed."""
+	global _hovered_thumb
+	if thumb is _hovered_thumb:
+		return
+	for changed_thumb in (_hovered_thumb, thumb):
+		if changed_thumb and changed_thumb.current_thumb_rect:
+			left, top, right, bottom = changed_thumb.current_thumb_rect
+			win32gui.InvalidateRect(hwnd, (left-2, top-2, right+2, bottom+2), False)
+	_hovered_thumb = thumb
+
+_last_on_top_state = set() # thumbs currently "on top"; only the symmetric difference needs invalidating each tick
+
+def refresh_on_top_highlights(hwnd):
+	"""Invalidate only the thumbnails whose on-top state changed since the last check."""
+	global _last_on_top_state
 	from src import main
 
-	# TODO: Make sure the window title and class still match the target application.
+	new_on_top_state = {thumb for thumb in main.g_thumbnail_slots.values() if is_window_on_top(thumb.source_hwnd)}
 
-	if ( main.g_source_hwnd and win32gui.IsWindow(main.g_source_hwnd)
-				and win32gui.IsWindowVisible(main.g_source_hwnd) ):
-		# Source window is still valid and visible
+	# Symmetric difference = thumbnails whose on-top state flipped (stale/removed slots drop out here too)
+	for thumb in _last_on_top_state ^ new_on_top_state:
+		# Hover/menu highlight already overrides the colour, so skip the repaint while active
+		if thumb is not _hovered_thumb and thumb.source_hwnd != _context_menu_target_hwnd and thumb.current_thumb_rect:
+			left, top, right, bottom = thumb.current_thumb_rect
+			win32gui.InvalidateRect(hwnd, (left-2, top-2, right+2, bottom+2), False)
+
+	_last_on_top_state = new_on_top_state
+
+def layout_thumbnails_evenly(thumbnails, client_rect):
+	"""Default layout: split client_rect into equal-width columns, one per thumbnail, with a gap between them.
+
+	Pluggable: reassign window_main.g_thumbnail_layout to a different function with the
+	same signature (list of ThumbnailManager, client_rect) to use a different arrangement.
+	"""
+	if not thumbnails:
 		return
+	left, top, right, bottom = client_rect
+	count = len(thumbnails)
+	gap = PIP_PADDING if count > 1 else 0
+	cell_width = (right - left - gap * (count - 1)) // count
+	x = left
+	for thumb in thumbnails:
+		thumb.update_thumbnail_rect((x, top, x + cell_width, bottom))
+		x += cell_width + gap
 
-	if main.g_source_hwnd:
-		print("Source window is no longer valid or visible. Attempting to find it again...")
-		main.g_source_hwnd = None # Reset the source window handle
+g_thumbnail_layout = layout_thumbnails_evenly # pluggable: swap to change layout strategy
 
-		# Mark the thumbnail as invalid but keep its rect for drawing
-		if main.g_thumbnail:
-			main.g_thumbnail.cleanup_thumbnail()  # This now preserves the rect but marks as invalid
+def layout_thumbnails(hwnd):
+	"""(Re)lay out all currently active thumbnail slots for the PiP window."""
+	from src import main
+	ordered = [main.g_thumbnail_slots[index] for index in sorted(main.g_thumbnail_slots)]
+	g_thumbnail_layout(ordered, get_inner_client_rect(hwnd))
+	win32gui.InvalidateRect(hwnd, None, True) # Also clears any now-vacated cells
 
-		win32gui.InvalidateRect(main.g_pip_hwnd, None, True)
+# TEMP TEST: delete this class (and its call sites become errors) to remove the test indicator
+class WindowTestMarker:
+	"""Draws a small red/blue square in the PiP window reflecting (currently) is_window_on_top(source)."""
+	TIMER = Timer(id=2099, ms=250)
+	RECT = (0, 0, 10, 10)
 
-	# Try to find the source window again
-	main.g_source_hwnd = main.g_target_app_match()
-	if not main.g_source_hwnd:
-		# Source window not found, try again later
-		return
+	def __init__(self):
+		self._last_state = None
 
-	# Re-register the thumbnail with the new source window
-	print(f"Found source window: {main.g_source_hwnd} ({win32gui.GetWindowText(main.g_source_hwnd)!r})")
-	pip_rect = get_inner_client_rect(main.g_pip_hwnd)
+	def start(self, hwnd):
+		self.TIMER.start(hwnd)
+
+	def check(self, hwnd):
+		"""Call on TIMER tick; invalidates the indicator rect if the state changed."""
+		from . import main
+		source_hwnd = next((t.source_hwnd for t in main.g_thumbnail_slots.values()), None)
+		state = is_window_on_top(source_hwnd)
+		if state != self._last_state:
+			self._last_state = state
+			win32gui.InvalidateRect(hwnd, self.RECT, False)
+
+	def draw(self, hdc):
+		"""Call from WM_PAINT to draw the indicator."""
+		from . import main
+		source_hwnd = next((t.source_hwnd for t in main.g_thumbnail_slots.values()), None)
+		color = THEME.TMB_ON_TOP if is_window_on_top(source_hwnd) else THEME.TMB_HOVER
+		brush = win32gui.CreateSolidBrush(color)
+		win32gui.FillRect(hdc, self.RECT, brush)
+		win32gui.DeleteObject(brush)
+
+# g_window_test_marker = WindowTestMarker() # TEMP TEST: disabled now the border colour conveys on-top state
+
+def handle_source_window_status(hwnd):
+	"""Poll each configured finder and keep its thumbnail slot in sync with what it currently matches."""
+	from src import main
 	from src.thumbnail import ThumbnailManager
-	main.g_thumbnail = ThumbnailManager(main.g_pip_hwnd, pip_rect, main.g_source_hwnd)
+
+	slots = main.g_thumbnail_slots
+	changed = False
+
+	for index, finder in enumerate(main.g_target_app_matches):
+		thumb = slots.get(index)
+
+		# Drop the slot if its window is no longer valid/visible
+		if thumb and not (win32gui.IsWindow(thumb.source_hwnd) and win32gui.IsWindowVisible(thumb.source_hwnd)):
+			print(f"Slot {index}: window is no longer valid or visible.")
+			thumb.cleanup_thumbnail()
+			del slots[index]
+			thumb = None
+			changed = True
+
+		found_hwnd = finder()
+		if not found_hwnd:
+			continue
+
+		if thumb is None:
+			print(f"Slot {index}: found window {found_hwnd} ({win32gui.GetWindowText(found_hwnd)!r})")
+			# Placeholder rect; layout_thumbnails() below assigns the real cell once the slot count is final
+			slots[index] = ThumbnailManager(hwnd, get_inner_client_rect(hwnd), found_hwnd)
+			changed = True
+		elif thumb.source_hwnd != found_hwnd:
+			print(f"Slot {index}: switching to window {found_hwnd} ({win32gui.GetWindowText(found_hwnd)!r})")
+			thumb.switch_source(found_hwnd)
+
+	if changed:
+		layout_thumbnails(hwnd)
 
 WINDOW_U_FLAGS = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED
 

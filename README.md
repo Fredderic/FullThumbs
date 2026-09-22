@@ -1,21 +1,24 @@
 # FullThumbs - Picture-in-Picture Window for Windows
 
-FullThumbs is a Picture-in-Picture (PiP) thumbnail viewer for Windows that provides a live, 
-resizable preview of any target application window. The application features three window 
-modes (normal, always-on-top, and minimal borderless), automatic git-based updates, 
-and comprehensive command-line options.
+FullThumbs is a Picture-in-Picture (PiP) thumbnail viewer for Windows that provides live, 
+resizable previews of one or more target application windows, shown simultaneously side by side. 
+The application features three window modes (normal, always-on-top, and minimal borderless), 
+automatic git-based updates, and comprehensive command-line options.
 
 ## Features
 
-- Live DWM thumbnail rendering of target applications
+- Live DWM thumbnail rendering of one or more target applications at once
+- Automatic layout of multiple thumbnails within the PiP window (pluggable layout strategy)
+- Border colour indicates thumbnail state: blue when its source window is on top/focused,
+  red when hovered (or its context menu is open), default otherwise
 - Three window display modes with context menu switching
 - Automatic git-based updates with configurable intervals
 - Flexible command-line argument parsing
 - Persistent window position and mode settings
 - Debug mode with auto-reload functionality
-- Click-through functionality to bring source app to front
-- Context menu with various options
-- Automatic window detection and re-attachment
+- Click a thumbnail to bring its source app to front
+- Context menu (per-thumbnail "Bring Source App to Front", plus window mode/update options)
+- Automatic window detection and re-attachment, independently for each configured target
 
 ## Requirements
 
@@ -200,15 +203,17 @@ python test_notifications.py
 ## Configuration
 
 - Window position and mode are automatically saved to `full-thumbs.json`
-- Target application can be modified by changing the `g_target_app_match` configuration in the script
+- Target applications are configured via the `g_target_app_matches` list in `src/main.py`;
+  each finder gets its own thumbnail slot, shown simultaneously with the others
 - Auto-update behavior is configurable via command-line arguments
 
 ## Controls
 
-- **Left-click on thumbnail**: Bring source application to front
-- **Right-click**: Open context menu with window mode options
-- **Drag window**: Move PiP window around
-- **Resize window**: Adjust PiP window size
+- **Left-click on a thumbnail**: Bring that thumbnail's source application to front
+- **Hover over a thumbnail**: Its border highlights red (stays highlighted while its context menu is open)
+- **Right-click**: Open context menu; "Bring Source App to Front" targets whichever thumbnail was under the cursor
+- **Drag window**: Move PiP window around (drag from the gaps between thumbnails)
+- **Resize window**: Adjust PiP window size; thumbnails are automatically relaid out to fill it
 
 ## Window Modes
 
