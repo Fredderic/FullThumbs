@@ -13,15 +13,15 @@ from .settings import save_window_placement
 
 # Global flag to track if git update check is running
 _git_update_checking = False
+_last_update_check_found = None # None = never checked, True/False = result of the last check
 
 def check_for_git_updates():
-	"""Check if git updates are available and exit with code 2 if they are.
-	Uses background thread to avoid blocking the UI.
+	"""Check if git updates are available (background thread). Only records the result for
+	display -- does not restart. Use request_restart() to actually act on a found update.
 	"""
 	import threading
-	from . import main
 	
-	global _git_update_checking
+	global _git_update_checking, _last_update_check_found
 	
 	# Check if an update check is already running
 	if _git_update_checking:
@@ -33,7 +33,7 @@ def check_for_git_updates():
 		import subprocess
 		import os
 		
-		global _git_update_checking
+		global _git_update_checking, _last_update_check_found
 		
 		try:
 			_git_update_checking = True
@@ -58,10 +58,9 @@ def check_for_git_updates():
 			)
 			
 			commits_behind = int(result.stdout.strip())
+			_last_update_check_found = commits_behind > 0
 			if commits_behind > 0:
-				print(f"Found {commits_behind} new commit(s). Requesting restart for update...")
-				main.g_exit_code = 2  # Signal update restart needed
-				win32gui.PostQuitMessage(2)
+				print(f"Found {commits_behind} new commit(s). Use 'Restart Thumbnail' from the context menu to install.")
 			else:
 				print("Application is up to date.")
 				
@@ -70,13 +69,27 @@ def check_for_git_updates():
 		except subprocess.CalledProcessError as e:
 			print(f"Git operation failed: {e}")
 		except Exception as e:
-			print(f"Error checking for git updates: {e}")
+			print(f"Error checking for updates: {e}")
 		finally:
 			_git_update_checking = False
 	
 	# Start the background check
 	thread = threading.Thread(target=_background_update_check, daemon=True)
 	thread.start()
+
+def request_restart(hwnd):
+	"""Ask the supervising full-thumbs.py loop to restart (and apply any pending update).
+
+	Restarts are never automatic -- this must be explicitly invoked. Always quits the app;
+	if nothing is supervising us (e.g. running main.py directly, or via the debugger without
+	--debug-loop), that just means nothing relaunches it afterwards.
+	"""
+	from . import main
+	if not main.g_supervised:
+		print("No supervisor is watching for a restart request -- quitting without a relaunch.")
+	print("Requesting restart...")
+	main.g_exit_code = 2  # Signal update restart needed
+	win32gui.PostQuitMessage(2)
 
 # -------
 
@@ -132,8 +145,7 @@ def present_context_menu(hwnd, screen_x, screen_y):
 	"""Present context menu at specified screen coordinates."""
 	global _context_menu_target_hwnd
 
-	from src.main import g_current_window_mode, g_thumbnail_slots # FIXME: , g_update_interval
-	from src.constants import DEBUG_PY
+	from src.main import g_current_window_mode, g_thumbnail_slots, g_supervised
 
 	client_x, client_y = win32gui.ScreenToClient(hwnd, (screen_x, screen_y))
 	target_thumb = find_thumbnail_at(g_thumbnail_slots, client_x, client_y)
@@ -164,12 +176,17 @@ def present_context_menu(hwnd, screen_x, screen_y):
 	
 	win32gui.AppendMenu(hmenu, win32con.MF_SEPARATOR, 0, "")
 	
-	# Always show "Check for Updates" but grey it out in debug mode
-	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_CHECK_UPDATES, "Check for Updates")
-	if DEBUG_PY:
-		win32gui.EnableMenuItem(hmenu, MENU_ID_CHECK_UPDATES, win32con.MF_GRAYED)
+	# "Check for Updates" is always available (it's just a read-only fetch); label reflects the last check
+	if _last_update_check_found:
+		update_menu_text = "Update Found - Restart to Install"
+	elif _last_update_check_found is False:
+		update_menu_text = "Check for Updates (up to date)"
+	else:
+		update_menu_text = "Check for Updates"
+	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_CHECK_UPDATES, update_menu_text)
 
-	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_RESTART_THUMBNAIL, "Restart Thumbnail")
+	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_RESTART_THUMBNAIL,
+		"Restart Thumbnail" if g_supervised else "Restart Thumbnail (unsupervised)")
 	
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_ABOUT, "About...")
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_EXIT, "Exit PiP")
@@ -615,10 +632,11 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 				# Check for git updates if enabled
 				from . import main
 				if getattr(main, 'g_debug_simulate_update', False):
-					# Debug mode: simulate finding updates
+					# Debug mode: simulate finding updates and immediately request the restart
+					# (this deliberately bypasses the normal "never automatic" rule, since it's
+					# only used to test full-thumbs.py's own supervised restart loop)
 					print("🐛 Debug: Simulating 'updates found' - requesting restart...")
-					main.g_exit_code = 2  # Signal update restart needed
-					win32gui.PostQuitMessage(2)
+					request_restart(hwnd)
 				else:
 					check_for_git_updates()
 				return 0
@@ -808,10 +826,7 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 				set_pip_window_style(WINDOW_MODE_MINIMAL)
 				return 0
 			elif cmd_id == MENU_ID_RESTART_THUMBNAIL:
-				# Use the update mechanism to restart
-				from src import main
-				main.g_debug_simulate_update = True
-				check_for_git_updates()
+				request_restart(hwnd)
 				return 0
 			else:
 				print(f"Unhandled command ID: {cmd_id}")
@@ -927,14 +942,11 @@ def refresh_on_top_highlights(hwnd):
 
 	_last_on_top_state = new_on_top_state
 
-def layout_thumbnails_evenly(thumbnails, client_rect):
-	"""Default layout: split client_rect into equal-width columns, one per thumbnail, with a gap between them.
-
-	Pluggable: reassign window_main.g_thumbnail_layout to a different function with the
-	same signature (list of ThumbnailManager, client_rect) to use a different arrangement.
-	"""
+def layout_thumbnails_evenly(hwnd, thumbnails):
+	"""Split the current inner client area into equal-width thumbnail columns."""
 	if not thumbnails:
 		return
+	client_rect = get_inner_client_rect(hwnd)
 	left, top, right, bottom = client_rect
 	count = len(thumbnails)
 	gap = PIP_PADDING if count > 1 else 0
@@ -944,13 +956,52 @@ def layout_thumbnails_evenly(thumbnails, client_rect):
 		thumb.update_thumbnail_rect((x, top, x + cell_width, bottom))
 		x += cell_width + gap
 
-g_thumbnail_layout = layout_thumbnails_evenly # pluggable: swap to change layout strategy
+PIP_MIN_CLIENT_WIDTH = 64
+
+def layout_thumbnails_anchor_right(hwnd, thumbnails):
+	"""Keep the outer right edge and height fixed while fitting full-height thumbnails."""
+	inner_left, inner_top, _, inner_bottom = get_inner_client_rect(hwnd)
+	inner_height = max(1, inner_bottom - inner_top)
+	gap = PIP_PADDING if len(thumbnails) > 1 else 0
+	column_widths = []
+	for thumb in thumbnails:
+		source_left, source_top, source_right, source_bottom = win32gui.GetClientRect(thumb.source_hwnd)
+		source_width = source_right - source_left
+		source_height = source_bottom - source_top
+		if source_width <= 0 or source_height <= 0:
+			raise ValueError("Invalid source window dimensions.")
+		column_widths.append(max(PIP_MIN_CLIENT_WIDTH, round(inner_height * source_width / source_height)))
+
+	if thumbnails:
+		desired_inner_width = sum(column_widths) + gap * (len(thumbnails) - 1)
+		desired_client_width = desired_inner_width + 2 * PIP_PADDING
+	else:
+		desired_client_width = PIP_MIN_CLIENT_WIDTH
+	window_left, window_top, window_right, window_bottom = win32gui.GetWindowRect(hwnd)
+	client_left, client_top, client_right, client_bottom = win32gui.GetClientRect(hwnd)
+	frame_width = (window_right - window_left) - (client_right - client_left)
+	desired_window_width = desired_client_width + frame_width
+
+	if window_right - window_left != desired_window_width:
+		win32gui.SetWindowPos(
+			hwnd, 0, window_right - desired_window_width, window_top,
+			desired_window_width, window_bottom - window_top,
+			win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE
+		)
+		return
+
+	x = inner_left
+	for thumb, column_width in zip(thumbnails, column_widths):
+		thumb.update_thumbnail_rect((x, inner_top, x + column_width, inner_bottom))
+		x += column_width + gap
+
+g_thumbnail_layout = layout_thumbnails_anchor_right # TODO: make the layout strategy configurable
 
 def layout_thumbnails(hwnd):
 	"""(Re)lay out all currently active thumbnail slots for the PiP window."""
 	from src import main
 	ordered = [main.g_thumbnail_slots[index] for index in sorted(main.g_thumbnail_slots)]
-	g_thumbnail_layout(ordered, get_inner_client_rect(hwnd))
+	g_thumbnail_layout(hwnd, ordered)
 	win32gui.InvalidateRect(hwnd, None, True) # Also clears any now-vacated cells
 
 # TEMP TEST: delete this class (and its call sites become errors) to remove the test indicator

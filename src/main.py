@@ -4,7 +4,7 @@ from win32api import GetSystemMetrics
 from .constants import DEBUG_PY, SETTINGS_FILE, WINDOW_MODE_NORMAL
 from .settings import load_window_placement, save_window_placement
 from .win_api import Timer, get_inner_client_rect
-from .window_main import TIMER_CHECK_SOURCE, TIMER_UPDATE_CHECK, create_pip_window, get_default_window_area, handle_source_window_status
+from .window_main import TIMER_CHECK_SOURCE, TIMER_UPDATE_CHECK, create_pip_window, get_default_window_area, handle_source_window_status, layout_thumbnails
 from .window_finder import window_finder_by_regex
 
 # -------
@@ -20,19 +20,22 @@ g_pip_hwnd = None # Global handle for the PiP window
 g_thumbnail_slots = {} # finder-index -> ThumbnailManager, for each currently matched window
 g_update_interval = 0  # Auto-update check interval
 g_debug_simulate_update = False  # Debug flag to simulate update restart
+g_supervised = False  # True if run_loop() spawned us as 'run' and will catch an exit-code-2 restart request
 
 
-def setup(update_interval_ms=0, debug_simulate_update=False):
+def setup(update_interval_ms=0, debug_simulate_update=False, supervised=False):
 	global g_target_app_matches, g_pip_hwnd, g_current_thumb_rect_in_pip
-	global g_current_window_mode, g_update_interval, g_debug_simulate_update
+	global g_current_window_mode, g_update_interval, g_debug_simulate_update, g_supervised
 	
 	g_update_interval = update_interval_ms
 	g_debug_simulate_update = debug_simulate_update
+	g_supervised = supervised
 
 	# List of windows to watch; each gets its own thumbnail slot, shown simultaneously.
-	g_target_app_matches = [
+	g_target_app_matches = [	# TODO -- this needs to be in configuration
 		window_finder_by_regex(r'^Sky$', 'TgcMainWindow'),
 		window_finder_by_regex(r'^Mabinogi$', 'Mabinogi'),
+		# window_finder_by_regex(r'^IDLE Shell', 'TkTopLevel'),
 	]
 
 	# Define PiP window size and position (e.g., bottom right of main monitor)
@@ -65,6 +68,8 @@ def setup(update_interval_ms=0, debug_simulate_update=False):
 
 	print(f"Attempting to find application(s)...")
 	handle_source_window_status(g_pip_hwnd) # Populate/layout initial thumbnail slot(s), if any are found
+	if not g_thumbnail_slots:	# If no thumbnails were found, layout the empty PiP window
+		layout_thumbnails(g_pip_hwnd)
 
 	print("Click a thumbnail to bring its source app to front.")
 	print("Right-click to close the PiP window and clean up.")

@@ -11,9 +11,7 @@ def _run_find_window(enum_windows_callback):
 	try:
 		win32gui.EnumWindows(enum_windows_callback, None)
 	except pywintypes.error as e:
-		if e.winerror == 18:  # "There are no more files."
-			pass  # Successfully found and stopped, no actual error
-		elif e.winerror == 3:  # "The system cannot find the path specified."
+		if e.winerror == 3:  # "The system cannot find the path specified."
 			# This can happen if a window handle becomes invalid during enumeration
 			print(f"Warning: Window enumeration encountered invalid handle (error {e.winerror}). This is usually harmless.")
 			print(f"Full error details: {e}")
@@ -34,10 +32,14 @@ def window_finder_by_title(title_substring):
 	def window_finder():
 		title_substring_l = title_substring.lower()
 		found_hwnd = None
+		exact_match_found = False
 		
 		def enum_windows_callback(hwnd, lParam):
-			nonlocal found_hwnd
+			nonlocal found_hwnd, exact_match_found
 			try:
+				if exact_match_found:
+					return True
+
 				# Validate window handle first
 				if not hwnd or not win32gui.IsWindow(hwnd):
 					return True  # Continue with next window
@@ -51,7 +53,7 @@ def window_finder_by_title(title_substring):
 					window_title_l = window_title.lower()
 					if title_substring_l == window_title_l:
 						found_hwnd = hwnd
-						return False  # Stop enumeration
+						exact_match_found = True
 					elif title_substring_l in window_title_l:
 						found_hwnd = hwnd
 			except pywintypes.error as e:
@@ -83,6 +85,9 @@ def window_finder_by_regex(title_match, class_match=None):
 		def enum_windows_callback(hwnd, lParam):
 			nonlocal found_hwnd, window_title, window_class
 			try:
+				if found_hwnd is not None:
+					return True
+
 				# Validate window handle first
 				if not hwnd or not win32gui.IsWindow(hwnd):
 					return True  # Continue with next window
@@ -98,7 +103,6 @@ def window_finder_by_regex(title_match, class_match=None):
 					if title_match.match(window_title) and (
 							class_match == window_class or not class_match):
 						found_hwnd = hwnd
-						return False  # Stop enumeration
 			except pywintypes.error as e:
 				# Handle cases where window becomes invalid during enumeration
 				if e.winerror in [2, 3, 6]:  # Common "invalid handle" type errors

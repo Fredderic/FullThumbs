@@ -117,9 +117,10 @@ def check_for_updates():
 		# Store the current commit for next check
 		check_for_updates._last_commit = current_commit
 		
-		# Check working directory status
+		# Check working directory status (ignore untracked files -- e.g. shortcuts or other
+		# stray files someone dropped in the folder aren't a reason to skip a git pull)
 		status_result = subprocess.run(
-			['git', 'status', '--porcelain'],
+			['git', 'status', '--porcelain', '--untracked-files=no'],
 			cwd=repo_dir,
 			capture_output=True,
 			text=True,
@@ -345,15 +346,17 @@ def run_loop(args):
 				print("Application encountered a fatal error and cannot continue.")
 				break
 			elif result == 2:
-				# Update restart request
-				print("Application requested update restart...")
+				# Restart requested (not necessarily update-related -- also used as a general
+				# "something might be wrong, please restart me" signal). Check for an update to
+				# apply, but restart either way by falling through to respawn below.
+				print("Application requested a restart...")
 				if ENABLE_GIT_OPERATIONS and check_for_updates():
 					# Updates were applied, restart immediately
 					continue
 				elif is_debug_loop:
-					print("🐛 Debug: Update restart requested but git operations disabled")
+					print("🐛 Debug: Restart requested but git operations disabled")
 				else:
-					print("No updates found despite restart request.")
+					print("No updates applied; restarting anyway as requested.")
 			else:
 				# Other unexpected exit codes
 				print(f"Application exited with unexpected code {result}. Stopping.")
@@ -395,7 +398,11 @@ if __name__ == "__main__":
 
 		update_interval = getattr(args, 'update_interval', 0) if args.command == 'run' else 0
 		simulate_update = getattr(args, 'debug_simulate_update', False)
-		main.setup(update_interval, simulate_update)
+		# Only the 'run' subcommand is spawned by run_loop()'s supervisor, which watches for
+		# exit code 2 and performs the actual git pull + restart; requesting it otherwise would
+		# just quit with nothing to catch it.
+		supervised = (args.command == 'run')
+		main.setup(update_interval, simulate_update, supervised)
 		
 		if simulate_update:
 			# In debug mode, the application will exit with code 2 when timer fires
