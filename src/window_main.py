@@ -3,10 +3,13 @@ Handles the main window creation and management for the FullThumbs application.
 """
 
 from types import SimpleNamespace
+from typing import Literal
 
 import win32gui, win32con, win32api
 
-from .constants import PIP_PADDING, WINDOW_MODE_MINIMAL, WINDOW_MODE_MINIMAL_TEXT, WINDOW_MODE_NORMAL, WINDOW_MODE_NORMAL_TEXT, WINDOW_MODE_TOPMOST, WINDOW_MODE_TOPMOST_TEXT
+from .constants import ( PIP_MIN_CLIENT_SIZE, PIP_PADDING, WINDOW_MODE_MINIMAL,
+        WINDOW_MODE_MINIMAL_TEXT, WINDOW_MODE_NORMAL, WINDOW_MODE_NORMAL_TEXT,
+        WINDOW_MODE_TOPMOST, WINDOW_MODE_TOPMOST_TEXT )
 from .win_api import Timer, split_lparam_pos, get_inner_client_rect, track_mouse_leave
 from .window_styles import get_window_style_flags
 from .settings import save_window_placement
@@ -139,16 +142,43 @@ TIMER_CHECK_SOURCE = Timer(id=2001, ms=200)  # Check source window every 200 ms
 TIMER_SAVE_WIN_POS = Timer(id=2002, ms=1000) # Save window position every second
 TIMER_UPDATE_CHECK = Timer(id=2003, ms=None) # Update check timer with configurable interval
 
+_timer_handlers = dict()
+def set_timer_handler(timer):
+	def wrapper(func):
+		_timer_handlers[timer.id] = func
+		return func
+	return wrapper
+
+@set_timer_handler(TIMER_SAVE_WIN_POS)
+def save_window_placement_handler(hwnd):
+	# Wraps save_window_placement() to also stop the timer afterward.
+	save_window_placement(hwnd)
+	TIMER_SAVE_WIN_POS.stop() # One-shot: only restarted by WM_MOVE/WM_SIZE
+
+@set_timer_handler(TIMER_UPDATE_CHECK)
+def update_check_handler(hwnd):
+	# Check for git updates if enabled
+	from . import main
+	if getattr(main, 'g_debug_simulate_update', False):
+		# Debug mode: simulate finding updates and immediately request the restart
+		# (this deliberately bypasses the normal "never automatic" rule, since it's
+		# only used to test full-thumbs.py's own supervised restart loop)
+		print("🐛 Debug: Simulating 'updates found' - requesting restart...")
+		request_restart(hwnd)
+	else:
+		check_for_git_updates()
+
+
 _context_menu_target_hwnd = None # Source hwnd of the thumbnail under the cursor at last right-click
 
 def present_context_menu(hwnd, screen_x, screen_y):
 	"""Present context menu at specified screen coordinates."""
 	global _context_menu_target_hwnd
 
-	from src.main import g_current_window_mode, g_thumbnail_slots, g_supervised
+	from . import main
 
 	client_x, client_y = win32gui.ScreenToClient(hwnd, (screen_x, screen_y))
-	target_thumb = find_thumbnail_at(g_thumbnail_slots, client_x, client_y)
+	target_thumb = find_thumbnail_at(main.g_thumbnail_slots, client_x, client_y)
 	_context_menu_target_hwnd = target_thumb.source_hwnd if target_thumb else None
 	# NOTE: not using set_hovered_thumb() here -- the popup can cause a spurious WM_MOUSELEAVE,
 	# so the border colour check in WM_PAINT also checks _context_menu_target_hwnd directly.
@@ -167,11 +197,11 @@ def present_context_menu(hwnd, screen_x, screen_y):
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_WINDOW_MODE_MINIMAL, WINDOW_MODE_MINIMAL_TEXT)
 	
 	# Check the current window mode
-	if g_current_window_mode == WINDOW_MODE_NORMAL:
+	if main.g_current_window_mode == WINDOW_MODE_NORMAL:
 		win32gui.CheckMenuItem(hmenu, MENU_ID_WINDOW_MODE_NORMAL, win32con.MF_CHECKED)
-	elif g_current_window_mode == WINDOW_MODE_TOPMOST:
+	elif main.g_current_window_mode == WINDOW_MODE_TOPMOST:
 		win32gui.CheckMenuItem(hmenu, MENU_ID_WINDOW_MODE_TOPMOST, win32con.MF_CHECKED)
-	elif g_current_window_mode == WINDOW_MODE_MINIMAL:
+	elif main.g_current_window_mode == WINDOW_MODE_MINIMAL:
 		win32gui.CheckMenuItem(hmenu, MENU_ID_WINDOW_MODE_MINIMAL, win32con.MF_CHECKED)
 	
 	win32gui.AppendMenu(hmenu, win32con.MF_SEPARATOR, 0, "")
@@ -186,7 +216,7 @@ def present_context_menu(hwnd, screen_x, screen_y):
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_CHECK_UPDATES, update_menu_text)
 
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_RESTART_THUMBNAIL,
-		"Restart Thumbnail" if g_supervised else "Restart Thumbnail (unsupervised)")
+		"Restart Thumbnail" if main.g_supervised else "Restart Thumbnail (unsupervised)")
 	
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_ABOUT, "About...")
 	win32gui.AppendMenu(hmenu, win32con.MF_STRING, MENU_ID_EXIT, "Exit PiP")
@@ -566,10 +596,9 @@ def show_about_dialog(parent_hwnd, about_text):
 
 def pip_window_proc(hwnd, msg, wparam, lparam):
 	"""Window procedure for the PiP window."""
+	from . import main
 
 	try:
-		from src import main
-
 		if msg == win32con.WM_NCHITTEST:
 			# Handle non-client area hit testing
 			
@@ -614,32 +643,9 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 			return 0
 
 		elif msg == win32con.WM_TIMER:
-			# Handle periodic checks for the source window
-			if wparam == TIMER_CHECK_SOURCE.id:
-				handle_source_window_status(hwnd)
-				refresh_on_top_highlights(hwnd)
+			if (handler := _timer_handlers.get(wparam)):
+				handler(hwnd)
 				return 0 # indicate we handled the message
-			elif wparam == TIMER_SAVE_WIN_POS.id:
-				# Save the current position of the PiP window
-				save_window_placement(hwnd)
-				TIMER_SAVE_WIN_POS.stop() # One-shot: only restarted by WM_MOVE/WM_SIZE
-				return 0 # indicate we handled the message
-			# elif wparam == WindowTestMarker.TIMER.id:
-			# 	# TEMP TEST: disabled now the border colour conveys on-top state
-			# 	g_window_test_marker.check(hwnd)
-			# 	return 0
-			elif wparam == TIMER_UPDATE_CHECK.id:
-				# Check for git updates if enabled
-				from . import main
-				if getattr(main, 'g_debug_simulate_update', False):
-					# Debug mode: simulate finding updates and immediately request the restart
-					# (this deliberately bypasses the normal "never automatic" rule, since it's
-					# only used to test full-thumbs.py's own supervised restart loop)
-					print("🐛 Debug: Simulating 'updates found' - requesting restart...")
-					request_restart(hwnd)
-				else:
-					check_for_git_updates()
-				return 0
 			# NOTE: do not call DefWindowProc for handled commands
 
 		elif msg == win32con.WM_PAINT:
@@ -834,7 +840,7 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 
 		elif msg == win32con.WM_CLOSE:
 			# Handle close message
-			save_window_placement(hwnd)
+			save_window_placement_handler(hwnd)	# also stops the timer
 			win32gui.DestroyWindow(hwnd)
 			# return 0
 		elif msg == win32con.WM_DESTROY:
@@ -924,24 +930,6 @@ def set_hovered_thumb(hwnd, thumb):
 			win32gui.InvalidateRect(hwnd, (left-2, top-2, right+2, bottom+2), False)
 	_hovered_thumb = thumb
 
-_last_on_top_state = set() # thumbs currently "on top"; only the symmetric difference needs invalidating each tick
-
-def refresh_on_top_highlights(hwnd):
-	"""Invalidate only the thumbnails whose on-top state changed since the last check."""
-	global _last_on_top_state
-	from src import main
-
-	new_on_top_state = {thumb for thumb in main.g_thumbnail_slots.values() if is_window_on_top(thumb.source_hwnd)}
-
-	# Symmetric difference = thumbnails whose on-top state flipped (stale/removed slots drop out here too)
-	for thumb in _last_on_top_state ^ new_on_top_state:
-		# Hover/menu highlight already overrides the colour, so skip the repaint while active
-		if thumb is not _hovered_thumb and thumb.source_hwnd != _context_menu_target_hwnd and thumb.current_thumb_rect:
-			left, top, right, bottom = thumb.current_thumb_rect
-			win32gui.InvalidateRect(hwnd, (left-2, top-2, right+2, bottom+2), False)
-
-	_last_on_top_state = new_on_top_state
-
 def layout_thumbnails_evenly(hwnd, thumbnails):
 	"""Split the current inner client area into equal-width thumbnail columns."""
 	if not thumbnails:
@@ -956,51 +944,102 @@ def layout_thumbnails_evenly(hwnd, thumbnails):
 		thumb.update_thumbnail_rect((x, top, x + cell_width, bottom))
 		x += cell_width + gap
 
-PIP_MIN_CLIENT_WIDTH = 64
+class LayoutThumbnailAnchorEdge:
+	_EDGES = ("top", "left", "bottom", "right")
 
-def layout_thumbnails_anchor_right(hwnd, thumbnails):
-	"""Keep the outer right edge and height fixed while fitting full-height thumbnails."""
-	inner_left, inner_top, _, inner_bottom = get_inner_client_rect(hwnd)
-	inner_height = max(1, inner_bottom - inner_top)
-	gap = PIP_PADDING if len(thumbnails) > 1 else 0
-	column_widths = []
-	for thumb in thumbnails:
-		source_left, source_top, source_right, source_bottom = win32gui.GetClientRect(thumb.source_hwnd)
-		source_width = source_right - source_left
-		source_height = source_bottom - source_top
-		if source_width <= 0 or source_height <= 0:
-			raise ValueError("Invalid source window dimensions.")
-		column_widths.append(max(PIP_MIN_CLIENT_WIDTH, round(inner_height * source_width / source_height)))
+	def __init__(self, edge: Literal[0,'top', 1,'left', 2,'bottom', 3,'right']): #type: ignore
+		if isinstance(edge, str):
+			edge: int = self._EDGES.index(edge)
+		if not isinstance(edge, int) or edge < 0 or edge >= 4:
+			raise ValueError(f"Unsupported anchor edge: {edge!r}")
+		# compute layout parameters based on the edge
+		majorFn = self.Xmajor if edge & 1 else self.Ymajor
+		anchor_end = edge & 2 > 0
+		self.layout_params = (majorFn, anchor_end)
 
-	if thumbnails:
-		desired_inner_width = sum(column_widths) + gap * (len(thumbnails) - 1)
-		desired_client_width = desired_inner_width + 2 * PIP_PADDING
-	else:
-		desired_client_width = PIP_MIN_CLIENT_WIDTH
-	window_left, window_top, window_right, window_bottom = win32gui.GetWindowRect(hwnd)
-	client_left, client_top, client_right, client_bottom = win32gui.GetClientRect(hwnd)
-	frame_width = (window_right - window_left) - (client_right - client_left)
-	desired_window_width = desired_client_width + frame_width
+	def __call__(self, hwnd, thumbnails):
+		return self.perform_layout(hwnd, thumbnails, *self.layout_params)
 
-	if window_right - window_left != desired_window_width:
-		win32gui.SetWindowPos(
-			hwnd, 0, window_right - desired_window_width, window_top,
-			desired_window_width, window_bottom - window_top,
-			win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE
-		)
-		return
+	class Xmajor:
+		@staticmethod
+		def fromRect(left, top, right, bottom) -> tuple[int, int, int, int]:
+			return left, right, top, bottom
 
-	x = inner_left
-	for thumb, column_width in zip(thumbnails, column_widths):
-		thumb.update_thumbnail_rect((x, inner_top, x + column_width, inner_bottom))
-		x += column_width + gap
+		@staticmethod
+		def toRect(major_start, major_end, minor_start, minor_end) -> tuple[int, int, int, int]:
+			return major_start, minor_start, major_end, minor_end
 
-g_thumbnail_layout = layout_thumbnails_anchor_right # TODO: make the layout strategy configurable
+	assert Xmajor.fromRect(1, 2, 3, 4) == (1, 3, 2, 4)
+	assert Xmajor.toRect  (1, 3, 2, 4) == (1, 2, 3, 4)
+
+	class Ymajor:
+		@staticmethod
+		def fromRect(left, top, right, bottom) -> tuple[int, int, int, int]:
+			return top, bottom, left, right
+
+		@staticmethod
+		def toRect(major_start, major_end, minor_start, minor_end) -> tuple[int, int, int, int]:
+			return minor_start, major_start, minor_end, major_end
+
+	assert Ymajor.fromRect(1, 2, 3, 4) == (2, 4, 1, 3)
+	assert Ymajor.toRect  (2, 4, 1, 3) == (1, 2, 3, 4)
+
+	def perform_layout(self, hwnd, thumbnails, major, anchor_end: bool):
+		"""Keep the outer right edge and height fixed while fitting full-height thumbnails."""
+		inner_major_start, _, inner_minor_start, inner_minor_end = major.fromRect(*get_inner_client_rect(hwnd))
+		inner_minor_size = max(1, inner_minor_end - inner_minor_start)
+		gap = PIP_PADDING if len(thumbnails) > 1 else 0
+
+		# Calculate the size of each thumbnail cell based on the source window
+		#	aspect ratios and the available inner client area.
+		cell_sizes = []
+		for thumb in thumbnails:
+			source_major_start, source_major_end, source_minor_start, source_minor_end = \
+					major.fromRect(*win32gui.GetClientRect(thumb.source_hwnd))
+			source_major_size = source_major_end - source_major_start
+			source_minor_size = source_minor_end - source_minor_start
+			if source_major_size <= 0 or source_minor_size <= 0:
+				raise ValueError("Invalid source window dimensions.")
+			cell_sizes.append(max(PIP_MIN_CLIENT_SIZE,
+			        round(inner_minor_size * source_major_size / source_minor_size)))
+		if thumbnails:
+			desired_inner_major = sum(cell_sizes) + gap * (len(thumbnails) - 1)
+			desired_client_major = max(PIP_MIN_CLIENT_SIZE, desired_inner_major) + 2 * PIP_PADDING
+		else:
+			desired_client_major = PIP_MIN_CLIENT_SIZE
+
+		# Adjust the PiP window size to accommodate the desired client area for thumbnails.
+		window_major_start, window_major_end, window_minor_start, window_minor_end = \
+				major.fromRect(*win32gui.GetWindowRect(hwnd))
+		client_major_start, client_major_end, _, _ = major.fromRect(*win32gui.GetClientRect(hwnd))
+		window_major_size = window_major_end - window_major_start
+		frame_major_size = window_major_size - (client_major_end - client_major_start)
+		desired_window_major = desired_client_major + frame_major_size
+
+		if window_major_size != desired_window_major:
+			if anchor_end:
+				# recalculate the window start position based on the desired window size and anchor end
+				window_major_start = window_major_end - desired_window_major
+			pos_x, pos_y, size_w, size_h = major.toRect(
+				window_major_start, desired_window_major,
+				window_minor_start, window_minor_end - window_minor_start
+			)
+			win32gui.SetWindowPos( hwnd, 0, pos_x, pos_y, size_w, size_h,
+					win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE )
+			return
+
+		# Position and size each thumbnail within the PiP window based on the calculated cell sizes.
+		p = inner_major_start
+		for thumb, cell_size in zip(thumbnails, cell_sizes):
+			thumb.update_thumbnail_rect(major.toRect(p, p + cell_size, inner_minor_start, inner_minor_end))
+			p += cell_size + gap
+
+g_thumbnail_layout = LayoutThumbnailAnchorEdge('right')
 
 def layout_thumbnails(hwnd):
 	"""(Re)lay out all currently active thumbnail slots for the PiP window."""
-	from src import main
-	ordered = [main.g_thumbnail_slots[index] for index in sorted(main.g_thumbnail_slots)]
+	from src.main import g_thumbnail_slots	# FIXME: put this somewhere importable
+	ordered = [g_thumbnail_slots[index] for index in sorted(g_thumbnail_slots)]
 	g_thumbnail_layout(hwnd, ordered)
 	win32gui.InvalidateRect(hwnd, None, True) # Also clears any now-vacated cells
 
@@ -1012,6 +1051,7 @@ class WindowTestMarker:
 
 	def __init__(self):
 		self._last_state = None
+		_timer_handlers[WindowTestMarker.TIMER.id] = self.check
 
 	def start(self, hwnd):
 		self.TIMER.start(hwnd)
@@ -1036,10 +1076,14 @@ class WindowTestMarker:
 
 # g_window_test_marker = WindowTestMarker() # TEMP TEST: disabled now the border colour conveys on-top state
 
+
+_last_on_top_state = set() # thumbs currently "on top"; only the symmetric difference needs invalidating each tick
+
+@set_timer_handler(TIMER_CHECK_SOURCE)
 def handle_source_window_status(hwnd):
 	"""Poll each configured finder and keep its thumbnail slot in sync with what it currently matches."""
-	from src import main
-	from src.thumbnail import ThumbnailManager
+	from . import main
+	from .thumbnail import ThumbnailManager
 
 	slots = main.g_thumbnail_slots
 	changed = False
@@ -1071,10 +1115,22 @@ def handle_source_window_status(hwnd):
 	if changed:
 		layout_thumbnails(hwnd)
 
+	# Invalidate rectangle of thumbnails whose on-top state changed since the last check.
+
+	global _last_on_top_state
+	new_on_top_state = {thumb for thumb in main.g_thumbnail_slots.values() if is_window_on_top(thumb.source_hwnd)}
+	for thumb in _last_on_top_state ^ new_on_top_state:
+		# Hover/menu highlight already overrides the colour, so skip the repaint while active
+		if thumb is not _hovered_thumb and thumb.source_hwnd != _context_menu_target_hwnd and thumb.current_thumb_rect:
+			left, top, right, bottom = thumb.current_thumb_rect
+			win32gui.InvalidateRect(hwnd, (left-2, top-2, right+2, bottom+2), False)
+	_last_on_top_state = new_on_top_state
+
+
 WINDOW_U_FLAGS = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED
 
 def set_pip_window_style(window_mode):
-	from src import main
+	from . import main
 	
 	if window_mode is None:
 		# Cycle to the next mode
