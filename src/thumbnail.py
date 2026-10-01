@@ -107,7 +107,7 @@ class ThumbnailManager:
 			# print(f"Failed to update thumbnail properties: HRESULT {result}")
 			raise RuntimeError(f"Failed to update thumbnail properties: HRESULT {result}")
 		
-		win32gui.InvalidateRect(self.target_hwnd, None, True)
+		win32gui.InvalidateRect(self.target_hwnd, None, True) #type: ignore
 	
 	def register_thumbnail(self):
 		"""Register a new thumbnail."""

@@ -4,7 +4,8 @@ from win32api import GetSystemMetrics
 from .constants import DEBUG_PY, SETTINGS_FILE, WINDOW_MODE_NORMAL
 from .settings import load_window_placement, save_window_placement
 from .win_api import Timer, get_inner_client_rect
-from .window_main import TIMER_CHECK_SOURCE, TIMER_UPDATE_CHECK, create_pip_window, get_default_window_area, handle_source_window_status, layout_thumbnails
+from .window_main import ( TIMER_CHECK_SOURCE, TIMER_UPDATE_CHECK, create_pip_window,
+			get_default_window_area, handle_source_window_status, layout_thumbnails )
 from .window_finder import window_finder_by_regex
 
 # -------
@@ -35,8 +36,9 @@ def setup(update_interval_ms=0, debug_simulate_update=False, supervised=False):
 	g_target_app_matches = [	# TODO -- this needs to be in configuration
 		window_finder_by_regex(r'^Sky$', 'TgcMainWindow'),
 		window_finder_by_regex(r'^Mabinogi$', 'Mabinogi'),
-		# window_finder_by_regex(r'^IDLE Shell', 'TkTopLevel'),
 	]
+	if DEBUG_PY:
+		g_target_app_matches.append(window_finder_by_regex(r'\*?IDLE Shell', 'TkTopLevel'))
 
 	# Define PiP window size and position (e.g., bottom right of main monitor)
 	if (settings := load_window_placement(SETTINGS_FILE)):

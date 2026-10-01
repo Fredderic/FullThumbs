@@ -2,17 +2,21 @@
 Handles the main window creation and management for the FullThumbs application.
 """
 
+import os, threading, subprocess
+
 from types import SimpleNamespace
 from typing import Literal
 
 import win32gui, win32con, win32api
 
-from .constants import ( PIP_MIN_CLIENT_SIZE, PIP_PADDING, WINDOW_MODE_MINIMAL,
+from .constants import ( DEBUG_PY, PIP_MIN_CLIENT_SIZE, PIP_PADDING, WINDOW_MODE_MINIMAL,
         WINDOW_MODE_MINIMAL_TEXT, WINDOW_MODE_NORMAL, WINDOW_MODE_NORMAL_TEXT,
         WINDOW_MODE_TOPMOST, WINDOW_MODE_TOPMOST_TEXT )
 from .win_api import Timer, split_lparam_pos, get_inner_client_rect, track_mouse_leave
 from .window_styles import get_window_style_flags
 from .settings import save_window_placement
+from .thumbnail import ThumbnailManager
+from .version import get_version_info
 
 # Global flag to track if git update check is running
 _git_update_checking = False
@@ -22,8 +26,6 @@ def check_for_git_updates():
 	"""Check if git updates are available (background thread). Only records the result for
 	display -- does not restart. Use request_restart() to actually act on a found update.
 	"""
-	import threading
-	
 	global _git_update_checking, _last_update_check_found
 	
 	# Check if an update check is already running
@@ -33,9 +35,6 @@ def check_for_git_updates():
 	
 	def _background_update_check():
 		"""Background function to perform git operations."""
-		import subprocess
-		import os
-		
 		global _git_update_checking, _last_update_check_found
 		
 		try:
@@ -714,18 +713,6 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 				win32gui.SelectObject(hdc, old_pen)
 				win32gui.DeleteObject(marker_pen)
 
-			# 	message = "Not Found"		-- TODO
-			# 	text_color = THEME.TEXT
-			# 	win32gui.SetTextColor(hdc, text_color)
-			# 	win32gui.SetBkMode(hdc, win32con.TRANSPARENT) # Transparent background
-			# 	# Draw the text in the center of the PiP window
-			# 	client_width = client_rect[2] - client_rect[0]
-			# 	client_height = client_rect[3] - client_rect[1]
-			# 	text_extent = win32gui.GetTextExtent(hdc, message)
-			# 	text_x = (client_width - text_extent[0]) // 2
-			# 	text_y = (client_height - text_extent[1]) // 2
-			# 	win32gui.TextOut(hdc, text_x, text_y, message)
-
 			# Restore original GDI objects
 			win32gui.SelectObject(hdc, old_brush) # NULL_BRUSH doesn't need deleting
 
@@ -791,8 +778,6 @@ def pip_window_proc(hwnd, msg, wparam, lparam):
 				return 0
 			elif cmd_id == MENU_ID_ABOUT:
 				# Show an about dialog with selectable text
-				from .version import get_version_info
-				from .constants import DEBUG_PY
 				info = get_version_info()
 				about_text = (
 					f"FullThumbs PiP Viewer\r\n"
@@ -867,7 +852,6 @@ def create_pip_window(x, y, width, height, window_mode, title="PiP View"):
 	"""Creates a PiP window with the specified window mode."""
 	
 	# Add debug indicator to title when running under debugger
-	from .constants import DEBUG_PY
 	if DEBUG_PY:
 		title += " (Debug)"
 
@@ -1030,7 +1014,10 @@ class LayoutThumbnailAnchorEdge:
 
 		# Position and size each thumbnail within the PiP window based on the calculated cell sizes.
 		p = inner_major_start
-		for thumb, cell_size in zip(thumbnails, cell_sizes):
+		sequence = zip(thumbnails, cell_sizes)
+		if anchor_end:
+			sequence = reversed(tuple(sequence))
+		for thumb, cell_size in sequence:
 			thumb.update_thumbnail_rect(major.toRect(p, p + cell_size, inner_minor_start, inner_minor_end))
 			p += cell_size + gap
 
@@ -1038,7 +1025,7 @@ g_thumbnail_layout = LayoutThumbnailAnchorEdge('right')
 
 def layout_thumbnails(hwnd):
 	"""(Re)lay out all currently active thumbnail slots for the PiP window."""
-	from src.main import g_thumbnail_slots	# FIXME: put this somewhere importable
+	from .main import g_thumbnail_slots
 	ordered = [g_thumbnail_slots[index] for index in sorted(g_thumbnail_slots)]
 	g_thumbnail_layout(hwnd, ordered)
 	win32gui.InvalidateRect(hwnd, None, True) # Also clears any now-vacated cells
@@ -1083,7 +1070,6 @@ _last_on_top_state = set() # thumbs currently "on top"; only the symmetric diffe
 def handle_source_window_status(hwnd):
 	"""Poll each configured finder and keep its thumbnail slot in sync with what it currently matches."""
 	from . import main
-	from .thumbnail import ThumbnailManager
 
 	slots = main.g_thumbnail_slots
 	changed = False
